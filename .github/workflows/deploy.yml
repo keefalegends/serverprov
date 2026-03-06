@@ -6,38 +6,35 @@ on:
   workflow_dispatch:
     inputs:
       skip_tests:
-        description: 'Skip test jobs'
+        description: Skip test jobs
         required: false
         default: 'false'
         type: boolean
 
 env:
-  AWS_REGION: us-east-1                              # ← region hardcode, konsisten
+  AWS_REGION: us-east-1
   APP_NAME: techno-codedeploy-app
   DEPLOYMENT_GROUP: techno-codedeploy-group
 
 jobs:
-  # ───────────────────────────────────────────────────────────────
-  # JOB 1: Track fork & notify owner
-  # ───────────────────────────────────────────────────────────────
+
+  # ─── JOB 1: Track fork ───────────────────────────────────────
   track-and-notify-owner:
-    name: "🔍 Track Repository & Notify Owner"
+    name: Track Repository
     runs-on: ubuntu-latest
     outputs:
       is_fork: ${{ steps.check_fork.outputs.is_fork }}
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Check if repository is a fork
+      - name: Check fork
         id: check_fork
         run: |
           IS_FORK="${{ github.event.repository.fork }}"
           echo "is_fork=$IS_FORK" >> $GITHUB_OUTPUT
-          echo "Repository: ${{ github.repository }} | Fork: $IS_FORK | Actor: ${{ github.actor }}"
+          echo "Repo: ${{ github.repository }} | Fork: $IS_FORK | Actor: ${{ github.actor }}"
 
-      - name: Configure AWS credentials (for fork notification)
+      - name: Configure AWS credentials
         if: steps.check_fork.outputs.is_fork == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -46,102 +43,87 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Notify owner about fork via SNS
+      - name: Notify fork via SNS
         if: steps.check_fork.outputs.is_fork == 'true'
         run: |
           aws sns publish \
             --topic-arn "${{ secrets.SNS_TOPIC_ARN }}" \
-            --subject "⚠️ Fork Detected: ${{ github.repository }}" \
-            --message "Fork detected!\nRepo: ${{ github.repository }}\nActor: ${{ github.actor }}\nCommit: ${{ github.sha }}" \
+            --subject "Fork Detected: ${{ github.repository }}" \
+            --message "Fork by ${{ github.actor }} on ${{ github.repository }} commit ${{ github.sha }}" \
             --region ${{ env.AWS_REGION }}
 
       - name: Log pipeline start
         run: |
-          echo "✅ Pipeline started by: ${{ github.actor }}"
-          echo "📦 Commit: ${{ github.sha }}"
-          echo "🌿 Branch: ${{ github.ref_name }}"
-          echo "⏰ Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Pipeline started by ${{ github.actor }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
 
-  # ───────────────────────────────────────────────────────────────
-  # JOB 2: Test - Syntax validation & Linting
-  # ───────────────────────────────────────────────────────────────
+  # ─── JOB 2: Test ─────────────────────────────────────────────
   test:
-    name: "🧪 Test & Lint Lambda Functions"
+    name: Test and Lint
     runs-on: ubuntu-latest
     needs: track-and-notify-owner
-    if: ${{ github.event.inputs.skip_tests != 'true' }}
-
+    if: github.event.inputs.skip_tests != 'true'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install testing dependencies
+      - name: Install dependencies
         run: pip install flake8 pyyaml
 
-      - name: Validate Python syntax (all Lambda functions)
+      - name: Validate Python syntax
         run: |
           for f in lambda/*/lambda_function.py; do
-            python -m py_compile "$f" && echo "✅ $f"
+            python -m py_compile "$f" && echo "OK: $f"
           done
 
-      - name: Run flake8 linting (critical errors only)
+      - name: Run flake8
         run: |
-          flake8 lambda/ \
-            --count \
-            --select=E9,F63,F7,F82 \
-            --show-source \
-            --statistics
-          echo "✅ Linting passed"
+          flake8 lambda/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          echo "Linting passed"
 
-      - name: Validate Step Functions ASL JSON
+      - name: Validate Step Functions ASL
         run: |
           python -c "
           import json
           with open('step_functions/order-workflow.json') as f:
-              data = json.load(f)
-          assert 'StartAt' in data and 'States' in data
-          print('✅ ASL JSON valid — States:', list(data['States'].keys()))
+              d = json.load(f)
+          assert 'StartAt' in d and 'States' in d
+          print('ASL JSON valid, states:', list(d['States'].keys()))
           "
 
-      - name: Validate AppSpec YAML
+      - name: Validate AppSpec
         run: |
           python -c "
           import yaml
           with open('codedeploy/appspec.yml') as f:
-              data = yaml.safe_load(f)
-          assert 'Resources' in data
-          print('✅ AppSpec YAML valid')
+              d = yaml.safe_load(f)
+          assert 'Resources' in d
+          print('AppSpec valid')
           "
 
       - name: Validate Frontend HTML
         run: |
           python -c "
           from html.parser import HTMLParser
-          class V(HTMLParser):
-              pass
           with open('frontend/index.html') as f:
-              content = f.read()
-          V().feed(content)
-          print(f'✅ Frontend HTML valid — {len(content):,} bytes')
+              src = f.read()
+          HTMLParser().feed(src)
+          print('HTML valid, size:', len(src), 'bytes')
           "
 
-  # ───────────────────────────────────────────────────────────────
-  # JOB 3: Deploy Lambda via CodeDeploy (matrix 7 functions)
-  # ───────────────────────────────────────────────────────────────
+  # ─── JOB 3: Deploy Lambda ────────────────────────────────────
   deploy-lambda:
-    name: "🚀 Deploy Lambda (${{ matrix.function.name }})"
+    name: Deploy Lambda ${{ matrix.function.name }}
     runs-on: ubuntu-latest
     needs: [track-and-notify-owner, test]
     if: github.ref == 'refs/heads/master'
-
     strategy:
-      max-parallel: 3          # deploy 3 fungsi bersamaan, tidak semua sekaligus
-      fail-fast: false          # fungsi lain tetap deploy meski 1 gagal
+      max-parallel: 3
+      fail-fast: false
       matrix:
         function:
           - { name: order-management,  dir: order_management  }
@@ -151,10 +133,8 @@ jobs:
           - { name: generate-report,   dir: generate_report   }
           - { name: init-db,           dir: init_db           }
           - { name: health-check,      dir: health_check      }
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -170,42 +150,40 @@ jobs:
           echo "FUNC_NAME=$FUNC_NAME" >> $GITHUB_ENV
           cd lambda/${{ matrix.function.dir }}
           zip -q /tmp/${FUNC_NAME}.zip lambda_function.py
-          echo "📦 Packaged: $FUNC_NAME ($(du -sh /tmp/${FUNC_NAME}.zip | cut -f1))"
+          echo "Packaged: $FUNC_NAME"
 
-      - name: Upload zip ke S3 & update Lambda code
+      - name: Upload zip to S3
         run: |
-          # Upload zip ke S3 sebagai artifact
           aws s3 cp /tmp/${FUNC_NAME}.zip \
             "s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/lambda/${FUNC_NAME}/${{ github.sha }}.zip" \
             --region ${{ env.AWS_REGION }}
 
-          # Update Lambda function code
+      - name: Update Lambda code
+        run: |
           aws lambda update-function-code \
             --function-name "$FUNC_NAME" \
             --zip-file "fileb:///tmp/${FUNC_NAME}.zip" \
             --region ${{ env.AWS_REGION }} \
             --no-cli-pager
-
-          # Tunggu update selesai
           aws lambda wait function-updated \
             --function-name "$FUNC_NAME" \
             --region ${{ env.AWS_REGION }}
-          echo "✅ Code updated: $FUNC_NAME"
+          echo "Code updated: $FUNC_NAME"
 
       - name: Publish Lambda version
         id: publish
         run: |
           VERSION=$(aws lambda publish-version \
             --function-name "$FUNC_NAME" \
-            --description "sha=${{ github.sha }} actor=${{ github.actor }} time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --description "sha=${{ github.sha }}" \
             --region ${{ env.AWS_REGION }} \
             --query 'Version' \
             --output text \
             --no-cli-pager)
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "🏷️  Published version: $VERSION"
+          echo "Published version: $VERSION"
 
-      - name: Get current alias version (Blue)
+      - name: Get current alias version
         id: blue
         run: |
           CURRENT=$(aws lambda get-alias \
@@ -216,14 +194,13 @@ jobs:
             --output text \
             --no-cli-pager 2>/dev/null || echo "1")
           echo "CURRENT=$CURRENT" >> $GITHUB_OUTPUT
-          echo "🔵 Blue=$CURRENT → 🟢 Green=${{ steps.publish.outputs.VERSION }}"
+          echo "Blue=$CURRENT Green=${{ steps.publish.outputs.VERSION }}"
 
-      - name: Upload AppSpec JSON ke S3
+      - name: Upload AppSpec to S3
         id: appspec
         run: |
           S3_KEY="codedeploy/${FUNC_NAME}/${{ github.sha }}.json"
-
-          cat > /tmp/appspec.json << EOF
+          cat > /tmp/appspec.json << APPSPEC
           {
             "version": 0.0,
             "Resources": [{
@@ -239,19 +216,16 @@ jobs:
             }],
             "Hooks": [
               { "BeforeAllowTraffic": "techno-lambda-health-check" },
-              { "AfterAllowTraffic": "techno-lambda-health-check" }
+              { "AfterAllowTraffic":  "techno-lambda-health-check" }
             ]
           }
-          EOF
-
+          APPSPEC
           aws s3 cp /tmp/appspec.json \
             "s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/${S3_KEY}" \
             --region ${{ env.AWS_REGION }}
-
           echo "S3_KEY=$S3_KEY" >> $GITHUB_OUTPUT
-          echo "📄 AppSpec uploaded: $S3_KEY"
 
-      - name: Trigger CodeDeploy Blue/Green deployment
+      - name: Create CodeDeploy deployment
         id: codedeploy
         run: |
           DEPLOYMENT_ID=$(aws deploy create-deployment \
@@ -259,34 +233,29 @@ jobs:
             --deployment-group-name "$DEPLOYMENT_GROUP" \
             --deployment-config-name "CodeDeployDefault.LambdaCanary10Percent5Minutes" \
             --revision "revisionType=S3,s3Location={bucket=${{ secrets.S3_DEPLOYMENT_BUCKET }},key=${{ steps.appspec.outputs.S3_KEY }},bundleType=JSON}" \
-            --description "Deploy ${FUNC_NAME} v${{ steps.publish.outputs.VERSION }} | ${{ github.sha }}" \
+            --description "Deploy ${FUNC_NAME} v${{ steps.publish.outputs.VERSION }}" \
             --region ${{ env.AWS_REGION }} \
             --query 'deploymentId' \
             --output text \
             --no-cli-pager)
           echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
-          echo "🎯 Deployment ID: $DEPLOYMENT_ID"
+          echo "Deployment ID: $DEPLOYMENT_ID"
 
-      - name: Wait for CodeDeploy deployment
+      - name: Wait for deployment
         run: |
-          echo "⏳ Canary 10% selama 5 menit..."
           aws deploy wait deployment-successful \
             --deployment-id "${{ steps.codedeploy.outputs.DEPLOYMENT_ID }}" \
             --region ${{ env.AWS_REGION }}
-          echo "✅ $FUNC_NAME deployed successfully!"
+          echo "Deployment successful: $FUNC_NAME"
 
-  # ───────────────────────────────────────────────────────────────
-  # JOB 4: Deploy Frontend via AWS Amplify
-  # ───────────────────────────────────────────────────────────────
+  # ─── JOB 4: Deploy Frontend ──────────────────────────────────
   deploy-frontend:
-    name: "🌐 Deploy Frontend (AWS Amplify)"
+    name: Deploy Frontend via Amplify
     runs-on: ubuntu-latest
     needs: [deploy-lambda]
     if: github.ref == 'refs/heads/master'
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -296,10 +265,10 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Validate frontend
+      - name: Validate frontend files
         run: |
-          test -f frontend/index.html && echo "✅ index.html found ($(wc -c < frontend/index.html) bytes)"
-          test -f amplify.yml && echo "✅ amplify.yml found"
+          test -f frontend/index.html && echo "index.html OK"
+          test -f amplify.yml && echo "amplify.yml OK"
 
       - name: Trigger Amplify build
         id: amplify
@@ -309,17 +278,17 @@ jobs:
             --branch-name master \
             --job-type RELEASE \
             --commit-id "${{ github.sha }}" \
-            --commit-message "CI/CD: ${{ github.sha }}" \
+            --commit-message "deploy ${{ github.sha }}" \
             --region ${{ env.AWS_REGION }} \
             --query 'jobSummary.jobId' \
             --output text \
             --no-cli-pager)
           echo "JOB_ID=$JOB_ID" >> $GITHUB_OUTPUT
-          echo "🔨 Amplify Job ID: $JOB_ID"
+          echo "Amplify Job: $JOB_ID"
 
       - name: Wait for Amplify build
         run: |
-          for i in {1..30}; do
+          for i in $(seq 1 30); do
             STATUS=$(aws amplify get-job \
               --app-id "${{ secrets.AMPLIFY_APP_ID }}" \
               --branch-name master \
@@ -328,26 +297,20 @@ jobs:
               --query 'job.summary.status' \
               --output text \
               --no-cli-pager)
-            echo "  [$i/30] Amplify status: $STATUS"
-            case "$STATUS" in
-              SUCCEED)  echo "✅ Amplify build succeeded!"; exit 0 ;;
-              FAILED)   echo "❌ Amplify build FAILED"; exit 1 ;;
-              CANCELLED) echo "⚠️ Amplify build CANCELLED"; exit 1 ;;
-            esac
+            echo "Attempt $i/30 - Status: $STATUS"
+            if [ "$STATUS" = "SUCCEED" ]; then echo "Amplify build succeeded"; exit 0; fi
+            if [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then echo "Amplify build $STATUS"; exit 1; fi
             sleep 30
           done
-          echo "⏰ Timeout — Amplify build masih berjalan, cek console"
+          echo "Timeout waiting for Amplify"
           exit 1
 
-  # ───────────────────────────────────────────────────────────────
-  # JOB 5: Notify hasil deployment via SNS
-  # ───────────────────────────────────────────────────────────────
+  # ─── JOB 5: Notify ───────────────────────────────────────────
   notify:
-    name: "📢 Send Deployment Notification"
+    name: Send Deployment Notification
     runs-on: ubuntu-latest
     needs: [deploy-lambda, deploy-frontend]
     if: always() && github.ref == 'refs/heads/master'
-
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -357,40 +320,20 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Send deployment report via SNS
+      - name: Send SNS notification
         run: |
           LAMBDA_RESULT="${{ needs.deploy-lambda.result }}"
           FRONTEND_RESULT="${{ needs.deploy-frontend.result }}"
-
-          if [ "$LAMBDA_RESULT" == "success" ] && [ "$FRONTEND_RESULT" == "success" ]; then
-            EMOJI="✅"; STATUS="SUCCESS"
+          if [ "$LAMBDA_RESULT" = "success" ] && [ "$FRONTEND_RESULT" = "success" ]; then
+            STATUS="SUCCESS"
           else
-            EMOJI="❌"; STATUS="FAILED"
+            STATUS="FAILED"
           fi
-
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           aws sns publish \
             --topic-arn "${{ secrets.SNS_TOPIC_ARN }}" \
-            --subject "${EMOJI} Deploy ${STATUS} - techno-serverless" \
-            --message "${EMOJI} Deployment Report
-
-Pipeline : techno-serverless-cicd
-Status   : ${STATUS}
-Region   : ${{ env.AWS_REGION }}
-Commit   : ${{ github.sha }}
-Actor    : ${{ github.actor }}
-Branch   : ${{ github.ref_name }}
-Time     : $(date -u +'%Y-%m-%d %H:%M:%S UTC')
-
-Jobs:
-  Lambda Deploy   : ${LAMBDA_RESULT}
-  Frontend Deploy : ${FRONTEND_RESULT}
-
-Strategy : Blue/Green (LambdaCanary10Percent5Minutes)
-Functions: 7 Lambda functions
-Frontend : AWS Amplify
-
-Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --subject "Deploy ${STATUS} - techno-serverless" \
+            --message "Status=${STATUS} Commit=${{ github.sha }} Actor=${{ github.actor }} Branch=${{ github.ref_name }} Time=${TIMESTAMP} Lambda=${LAMBDA_RESULT} Frontend=${FRONTEND_RESULT} Run=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --region ${{ env.AWS_REGION }} \
             --no-cli-pager
-
-          echo "📢 Notification sent | Pipeline: $STATUS"
+          echo "Notification sent - $STATUS"
