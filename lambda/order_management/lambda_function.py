@@ -3,6 +3,7 @@ import boto3
 import psycopg2
 import os
 import logging
+from urllib.parse import unquote
 from datetime import datetime
 from aws_xray_sdk.core import xray_recorder
 from aws_xray_sdk.core import patch_all
@@ -107,6 +108,7 @@ def lambda_handler(event, context):
         # GET /status/{id}
         if path.startswith('/status/') and http_method == 'GET':
             execution_arn = path_params.get('id') or path.split('/status/')[-1]
+            execution_arn = unquote(execution_arn)  # decode %3A -> :
             return get_execution_status(execution_arn)
 
         return response(404, {'error': 'Route not found'})

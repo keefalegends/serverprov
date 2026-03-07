@@ -931,7 +931,7 @@ async function loadExecutions() {
 
     // Fetch status for each tracked ARN (parallel, max 10)
     const arns = [...S.trackedArns].slice(0,15);
-    const statuses = await Promise.allSettled(arns.map(arn=>api(`/status/${encodeURIComponent(arn)}`)));
+    const statuses = await Promise.allSettled(arns.map(arn=>api(`/status/${arn}`)));
 
     S.executions = statuses
       .map((r,i)=>r.status==='fulfilled'?{...r.value, arn:arns[i]}:{ arn:arns[i], status:'UNKNOWN' })
@@ -1019,7 +1019,7 @@ function toggleLivePolling() {
 async function pollExecutions() {
   if (!S.trackedArns.size) return;
   const arns = [...S.trackedArns].slice(0,15);
-  const statuses = await Promise.allSettled(arns.map(a=>api(`/status/${encodeURIComponent(a)}`)));
+  const statuses = await Promise.allSettled(arns.map(a=>api(`/status/${a}`)));
   S.executions = statuses.map((r,i)=>r.status==='fulfilled'?{...r.value,arn:arns[i]}:{arn:arns[i],status:'UNKNOWN'});
   renderExecutionsList();
   updateSFDashboardStats();
@@ -1052,7 +1052,7 @@ async function openExecModal(arn) {
 async function refreshExecModal() {
   if (!S.execModalArn) return;
   try {
-    const d = await api(`/status/${encodeURIComponent(S.execModalArn)}`);
+    const d = await api(`/status/${S.execModalArn}`);
     renderExecModal(d);
     // Auto-poll if still running
     if (d.status==='RUNNING') {

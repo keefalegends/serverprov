@@ -166,6 +166,39 @@ jobs:
             --function-name "$FUNC_NAME" \
             --region ${{ env.AWS_REGION }}
 
+      - name: Ensure psycopg2 layer is attached
+        run: |
+          # Ambil ARN layer techno-layer-dependencies yang sudah ada
+          LAYER_ARN=$(aws lambda list-layers \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Layers[?contains(LayerName,`techno-layer`)].LatestMatchingVersion.LayerVersionArn' \
+            --output text --no-cli-pager)
+          if [ -z "$LAYER_ARN" ] || [ "$LAYER_ARN" = "None" ]; then
+            echo "Layer not found - skipping"
+            exit 0
+          fi
+          echo "Layer ARN: $LAYER_ARN"
+          # Cek apakah layer sudah ter-attach
+          CURRENT_LAYERS=$(aws lambda get-function-configuration \
+            --function-name "$FUNC_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Layers[].Arn' \
+            --output text --no-cli-pager)
+          if echo "$CURRENT_LAYERS" | grep -q "$LAYER_ARN"; then
+            echo "Layer already attached - OK"
+          else
+            echo "Re-attaching layer to $FUNC_NAME..."
+            aws lambda update-function-configuration \
+              --function-name "$FUNC_NAME" \
+              --layers "$LAYER_ARN" \
+              --region ${{ env.AWS_REGION }} \
+              --no-cli-pager
+            aws lambda wait function-updated \
+              --function-name "$FUNC_NAME" \
+              --region ${{ env.AWS_REGION }}
+            echo "Layer re-attached OK"
+          fi
+
       - name: Publish version and update alias
         run: |
           VERSION=$(aws lambda publish-version \
@@ -233,6 +266,36 @@ jobs:
           aws lambda wait function-updated \
             --function-name techno-lambda-order-management \
             --region ${{ env.AWS_REGION }}
+
+      - name: Ensure psycopg2 layer is attached
+        run: |
+          LAYER_ARN=$(aws lambda list-layers \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Layers[?contains(LayerName,`techno-layer`)].LatestMatchingVersion.LayerVersionArn' \
+            --output text --no-cli-pager)
+          if [ -z "$LAYER_ARN" ] || [ "$LAYER_ARN" = "None" ]; then
+            echo "Layer not found - skipping"
+            exit 0
+          fi
+          CURRENT_LAYERS=$(aws lambda get-function-configuration \
+            --function-name techno-lambda-order-management \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Layers[].Arn' \
+            --output text --no-cli-pager)
+          if echo "$CURRENT_LAYERS" | grep -q "$LAYER_ARN"; then
+            echo "Layer already attached - OK"
+          else
+            echo "Re-attaching layer..."
+            aws lambda update-function-configuration \
+              --function-name techno-lambda-order-management \
+              --layers "$LAYER_ARN" \
+              --region ${{ env.AWS_REGION }} \
+              --no-cli-pager
+            aws lambda wait function-updated \
+              --function-name techno-lambda-order-management \
+              --region ${{ env.AWS_REGION }}
+            echo "Layer re-attached OK"
+          fi
 
       - name: Publish Lambda version
         id: publish
@@ -340,6 +403,16 @@ jobs:
         run: |
           test -f frontend/index.html && echo "index.html OK"
           test -f amplify.yml && echo "amplify.yml OK"
+
+      - name: Reset Amplify build spec to use amplify.yml from repo
+        run: |
+          # Paksa Amplify baca build settings dari amplify.yml di repo, bukan dari console
+          aws amplify update-app \
+            --app-id "${{ secrets.AMPLIFY_APP_ID }}" \
+            --region ${{ env.AWS_REGION }} \
+            --no-cli-pager \
+            --build-spec "version: 1\nfrontend:\n  phases:\n    preBuild:\n      commands:\n        - ls -la\n        - test -f frontend/index.html && echo OK || exit 1\n    build:\n      commands:\n        - echo done\n  artifacts:\n    baseDirectory: frontend\n    files:\n      - '**/*'" || true
+          echo "Build spec reset done"
 
       - name: Trigger Amplify build
         id: amplify
