@@ -296,12 +296,54 @@ def delete_order(order_id):
 
 def get_execution_status(execution_arn):
     try:
-        sf_response = stepfunctions_client.describe_execution(executionArn=execution_arn)
-        return response(200, {
+        sf = stepfunctions_client.describe_execution(executionArn=execution_arn)
+        status = sf['status']
+
+        result = {
             'execution_arn': execution_arn,
-            'status': sf_response['status'],
-            'start_date': sf_response.get('startDate'),
-            'stop_date': sf_response.get('stopDate'),
-        })
+            'status': status,
+            'start_date': sf.get('startDate').isoformat() if sf.get('startDate') else None,
+            'stop_date': sf.get('stopDate').isoformat() if sf.get('stopDate') else None,
+            'error': sf.get('cause') and sf.get('error') or None,
+            'cause': sf.get('cause'),
+        }
+
+        # Ambil event history untuk tahu di state mana gagal
+        try:
+            hist = stepfunctions_client.get_execution_history(
+                executionArn=execution_arn,
+                maxResults=50,
+                reverseOrder=False
+            )
+            events = []
+            failed_state = None
+            for ev in hist.get('events', []):
+                ev_type = ev.get('type', '')
+                ev_detail = {}
+
+                if 'stateEnteredEventDetails' in ev:
+                    ev_detail = {'name': ev['stateEnteredEventDetails'].get('name')}
+                elif 'stateExitedEventDetails' in ev:
+                    ev_detail = {'name': ev['stateExitedEventDetails'].get('name')}
+                elif 'taskFailedEventDetails' in ev:
+                    d = ev['taskFailedEventDetails']
+                    ev_detail = {'error': d.get('error'), 'cause': d.get('cause','')[:300]}
+                    failed_state = d.get('error')
+                elif 'executionFailedEventDetails' in ev:
+                    d = ev['executionFailedEventDetails']
+                    ev_detail = {'error': d.get('error'), 'cause': d.get('cause','')[:300]}
+                    result['error'] = d.get('error')
+                    result['cause'] = d.get('cause','')[:500]
+
+                events.append({'type': ev_type, **ev_detail})
+
+            result['events'] = events
+            if failed_state and not result.get('error'):
+                result['error'] = failed_state
+
+        except Exception:
+            pass  # event history optional
+
+        return response(200, result)
     except Exception as e:
         return response(404, {'error': str(e)})

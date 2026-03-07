@@ -23,7 +23,7 @@ techno-juri/
 └── .github/workflows/
     └── deploy.yml              ← GitHub Actions CI/CD (5 jobs)
 ```
- 
+
 ---
 
 ## STEP 1 — Deploy Infrastruktur (Satu Script)
@@ -67,7 +67,7 @@ curl -s -X POST "$API_URL/orders" \
   -d '{"customerId":"CUST001","items":[{"productId":"PROD001","quantity":2}],"totalAmount":50000}' \
   | python3 -m json.tool
 ```
-
+ 
 ---
 
 ## STEP 3 — Setup AWS Amplify (Frontend)
