@@ -163,8 +163,13 @@ cleanup_failed_stack() {
 # ── resolve_state: baca resource yang sudah ada ───────────
 resolve_state() {
     log "Resolving AWS resource state..."
+    # Cari API — coba nama baru dulu, fallback ke nama lama
     API_ID=$(aws apigateway get-rest-apis --region "$REGION" \
         --query "items[?name=='${PROJECT}-api-orders'].id" \
+        --output text 2>/dev/null || echo "")
+    [ -z "$API_ID" ] || [ "$API_ID" = "None" ] && \
+    API_ID=$(aws apigateway get-rest-apis --region "$REGION" \
+        --query "items[?name=='${PROJECT}-api'].id" \
         --output text 2>/dev/null || echo "")
     API_KEY_VALUE=$(aws apigateway get-api-keys \
         --name-query "${PROJECT}-api-orders-key" --include-values \
@@ -389,7 +394,8 @@ chk("EventBridge","Rule techno-daily-report ENABLED",3, lambda: (
     ev.describe_rule(Name=f"{P}-daily-report")["State"] == "ENABLED" and "ENABLED"
 ))
 
-# Stack CFN tidak dipakai — CloudWatch dibuat via CLI
+# ── CloudWatch ───────────────────────────────────────────
+cw = boto3.client("cloudwatch", region_name=region)
 chk("CloudWatch","Dashboard techno-dashboard-serverless exists",4, lambda: (
     cw.get_dashboard(DashboardName="techno-dashboard-serverless")
     ["DashboardName"]
@@ -983,20 +989,22 @@ if ! skip_step 4; then
     ok "SNS Topic: $SNS_TOPIC_ARN"
     warn "⚠  Cek inbox dan CONFIRM subscription email SNS!"
 
-    # Secret format HARUS sesuai yang dibaca Lambda: host/dbname/username/password
+    # Secret: SELALU update dengan RDS endpoint terbaru
+    log "Updating Secret dengan RDS endpoint terbaru: $RDS_ENDPOINT"
     SECRET_STRING="{\"host\":\"${RDS_ENDPOINT}\",\"dbname\":\"techno_db\",\"username\":\"adminuser\",\"password\":\"TechnoOMS2026!\",\"port\":5432}"
-    SECRET_ARN=$(aws secretsmanager create-secret \
-        --name "${PROJECT}/db/credentials" \
+    SECRET_ARN=$(aws secretsmanager put-secret-value \
+        --secret-id "${PROJECT}/db/credentials" \
         --secret-string "$SECRET_STRING" \
         --region "$REGION" --query ARN --output text 2>/dev/null || \
-    aws secretsmanager put-secret-value \
-        --secret-id "${PROJECT}/db/credentials" \
+    aws secretsmanager create-secret \
+        --name "${PROJECT}/db/credentials" \
         --secret-string "$SECRET_STRING" \
         --region "$REGION" --query ARN --output text 2>/dev/null || \
     aws secretsmanager describe-secret \
         --secret-id "${PROJECT}/db/credentials" \
         --query ARN --output text --region "$REGION")
-    ok "Secret ARN: $SECRET_ARN"
+    ok "Secret ARN  : $SECRET_ARN"
+    ok "Secret host : $RDS_ENDPOINT"
 fi
 
 # Refresh SNS_TOPIC_ARN if skipped step 4
@@ -1311,6 +1319,38 @@ open('/tmp/techno_placeholder.zip','wb').write(buf.getvalue())
     ok "Lambda functions ready"
 fi
 
+# Refresh SECRET_ARN setelah step 4/5 — pastikan Lambda env up to date
+SECRET_ARN=$(aws secretsmanager describe-secret \
+    --secret-id "${PROJECT}/db/credentials" \
+    --query ARN --output text --region "$REGION" 2>/dev/null || echo "")
+if [ -n "$SECRET_ARN" ] && [ "$SECRET_ARN" != "None" ]; then
+    log "Refreshing Lambda SECRET_ARN env var: $SECRET_ARN"
+    for _FN in techno-lambda-order-management techno-lambda-process-payment \
+               techno-lambda-update-inventory techno-lambda-generate-report \
+               techno-lambda-init-db techno-lambda-health-check; do
+        _CURR=$(aws lambda get-function-configuration --function-name "$_FN" \
+            --region "$REGION" --query "Environment.Variables.SECRET_ARN" \
+            --output text 2>/dev/null || echo "")
+        if [ "$_CURR" != "$SECRET_ARN" ]; then
+            # Get current env vars and merge
+            _ENV=$(aws lambda get-function-configuration --function-name "$_FN" \
+                --region "$REGION" --query "Environment.Variables" --output json 2>/dev/null || echo "{}")
+            _NEW_ENV=$(echo "$_ENV" | python3 -c "
+import json,sys
+e=json.load(sys.stdin)
+e['SECRET_ARN']='${SECRET_ARN}'
+print('Variables={' + ','.join(f'{k}={v}' for k,v in e.items()) + '}')
+" 2>/dev/null || echo "Variables={SECRET_ARN=${SECRET_ARN}}")
+            aws lambda update-function-configuration \
+                --function-name "$_FN" \
+                --environment "$_NEW_ENV" \
+                --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+            log "  Updated SECRET_ARN: $_FN"
+        fi
+    done
+    ok "Lambda SECRET_ARN env vars refreshed"
+fi
+
 # Refresh LAYER_ARN
 LAYER_ARN=$(aws lambda list-layer-versions \
     --layer-name "$LAYER_NAME" --region "$REGION" \
@@ -1443,8 +1483,14 @@ SFEOF
 
 
 
-    # Update Lambda env with SF_ARN
-    for FUNC_BASE in order_management process_payment health_check; do
+    # Update Lambda env: pastikan SECRET_ARN + SF_ARN semua terisi
+    SECRET_ARN_FRESH=$(aws secretsmanager describe-secret \
+        --secret-id "${PROJECT}/db/credentials" \
+        --query ARN --output text --region "$REGION" 2>/dev/null || echo "")
+    [ -z "$SECRET_ARN_FRESH" ] && SECRET_ARN_FRESH="$SECRET_ARN"
+
+    for FUNC_BASE in order_management process_payment update_inventory \
+                     generate_report init_db health_check; do
         # Map dir name → AWS function name (sesuai deploy.yml naming)
         case "$FUNC_BASE" in
             order_management)  FUNC_NAME="techno-lambda-order-management"  ;;
@@ -1474,8 +1520,13 @@ SF_ARN=$(aws stepfunctions list-state-machines --region "$REGION" \
 section "STEP 7/11 — API Gateway (REST API)"
 if ! skip_step 7; then
     # Create or get API
+    # Cari API — coba nama baru dulu, fallback ke nama lama
     API_ID=$(aws apigateway get-rest-apis --region "$REGION" \
         --query "items[?name=='${PROJECT}-api-orders'].id" \
+        --output text 2>/dev/null || echo "")
+    [ -z "$API_ID" ] || [ "$API_ID" = "None" ] && \
+    API_ID=$(aws apigateway get-rest-apis --region "$REGION" \
+        --query "items[?name=='${PROJECT}-api'].id" \
         --output text 2>/dev/null || echo "")
 
     # Migrate: cek apakah ada API lama 'techno-api', rename
