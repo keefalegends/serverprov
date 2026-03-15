@@ -928,30 +928,73 @@ if ! skip_step 5; then
             done
             LAYER_ARN=""
         fi
-        log "Building Lambda Layer dengan platform Linux x86_64..."
         LAYER_DIR="/tmp/techno_layer"
+        REQUIREMENTS_FILE="${SCRIPT_DIR}/lambda/requirements.txt"
+        [ -f "$REQUIREMENTS_FILE" ] || err "requirements.txt tidak ditemukan di ${SCRIPT_DIR}/lambda/"
+
         rm -rf "$LAYER_DIR" && mkdir -p "${LAYER_DIR}/python"
 
-        REQUIREMENTS_FILE="${SCRIPT_DIR}/lambda/requirements.txt"
-        if [ -f "$REQUIREMENTS_FILE" ]; then
-            log "  pip install --platform manylinux2014_x86_64 (agar psycopg2/binary compatible di Lambda)..."
-            pip3 install -r "$REQUIREMENTS_FILE" \
-                --target "${LAYER_DIR}/python" \
-                --platform manylinux2014_x86_64 \
-                --implementation cp \
-                --python-version 3.11 \
-                --only-binary=:all: \
-                --upgrade \
-                --quiet 2>/dev/null && \
-            log "  pip install sukses (manylinux)" || {
-                warn "  manylinux gagal, fallback tanpa platform flag..."
-                pip3 install -r "$REQUIREMENTS_FILE" \
-                    --target "${LAYER_DIR}/python" \
-                    --quiet --no-cache-dir 2>/dev/null || \
-                warn "  pip install gagal, layer minimal"
-            }
+        # ── Strategi build layer (urutan prioritas) ───────────────
+        # 1. Docker (paling benar — compile di environment Lambda yang sama)
+        # 2. pip source install di Linux native (CloudShell/EC2)
+        # 3. pip --no-binary fallback
+        #
+        # psycopg2-binary TIDAK bisa pakai --platform manylinux karena
+        # wheel-nya tidak include libpq.so. Harus compile dari source
+        # di Linux environment yang sama dengan Lambda (Amazon Linux 2023).
+
+        LAYER_BUILD_OK=false
+
+        # ── Metode 1: Docker ─────────────────────────────────────
+        if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+            log "  Metode 1: Docker build (Amazon Linux 2023 = Lambda runtime)..."
+            docker run --rm                 -v "${LAYER_DIR}/python:/var/task/python"                 -v "${REQUIREMENTS_FILE}:/var/task/requirements.txt:ro"                 public.ecr.aws/lambda/python:3.11                 /bin/bash -c "
+                    pip install -r /var/task/requirements.txt                         --target /var/task/python                         --no-binary psycopg2-binary                         --upgrade -q
+                " && LAYER_BUILD_OK=true && ok "  Docker build sukses" ||                 warn "  Docker build gagal, coba metode lain..."
         else
-            warn "requirements.txt tidak ditemukan di ${SCRIPT_DIR}/lambda/"
+            warn "  Docker tidak tersedia, skip metode 1"
+        fi
+
+        # ── Metode 2: pip source build di Linux native ────────────
+        if [ "$LAYER_BUILD_OK" = "false" ]; then
+            log "  Metode 2: pip source build di Linux native..."
+            # Pastikan postgresql-devel tersedia untuk compile psycopg2
+            if command -v yum &>/dev/null; then
+                sudo yum install -y postgresql-devel gcc python3-devel 2>/dev/null || true
+            elif command -v apt-get &>/dev/null; then
+                sudo apt-get install -y libpq-dev gcc python3-dev 2>/dev/null || true
+            fi
+            pip3 install -r "$REQUIREMENTS_FILE"                 --target "${LAYER_DIR}/python"                 --no-binary psycopg2-binary                 --upgrade -q 2>/dev/null &&             LAYER_BUILD_OK=true && ok "  pip source build sukses" ||             warn "  pip source build gagal, coba metode 3..."
+        fi
+
+        # ── Metode 3: pip tanpa psycopg2, pakai versi pre-compiled ─
+        if [ "$LAYER_BUILD_OK" = "false" ]; then
+            log "  Metode 3: install semua paket + psycopg2-binary Lambda wheel..."
+            rm -rf "${LAYER_DIR}/python" && mkdir -p "${LAYER_DIR}/python"
+
+            # Install semua paket kecuali psycopg2 dulu
+            grep -v "psycopg2" "$REQUIREMENTS_FILE" > /tmp/req_no_psyco.txt || true
+            pip3 install -r /tmp/req_no_psyco.txt                 --target "${LAYER_DIR}/python" -q 2>/dev/null || true
+
+            # Download psycopg2-binary wheel khusus Lambda (awslambda-psycopg2)
+            # ini adalah psycopg2 yang sudah dikompilasi untuk Amazon Linux
+            pip3 install aws-psycopg2                 --target "${LAYER_DIR}/python" -q 2>/dev/null ||             pip3 install psycopg2-binary                 --target "${LAYER_DIR}/python"                 --platform manylinux2014_x86_64                 --implementation cp --python-version 3.11                 --only-binary=:all: -q 2>/dev/null ||             warn "  Semua metode psycopg2 gagal"
+
+            LAYER_BUILD_OK=true
+            warn "  Metode 3 digunakan — psycopg2 mungkin perlu verifikasi"
+        fi
+
+        # ── Verifikasi struktur folder ────────────────────────────
+        PYLIB_COUNT=$(find "${LAYER_DIR}/python" -maxdepth 1 -mindepth 1 | wc -l)
+        log "  Packages di python/: ${PYLIB_COUNT}"
+        ls "${LAYER_DIR}/python" | head -20
+        # Wajib: psycopg2 harus ada di dalam python/
+        if [ -d "${LAYER_DIR}/python/psycopg2" ]; then
+            ok "  psycopg2/ folder ditemukan di layer ✓"
+            ls "${LAYER_DIR}/python/psycopg2/" | head -5
+        else
+            warn "  WARNING: psycopg2/ folder TIDAK ditemukan di layer!"
+            warn "  Pastikan requirements.txt berisi psycopg2-binary atau psycopg2"
         fi
 
         log "  Zipping layer..."
