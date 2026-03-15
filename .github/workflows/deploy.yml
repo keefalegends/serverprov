@@ -103,8 +103,6 @@ jobs:
           "
 
   # ─── JOB 3: Deploy 6 Lambda (update alias langsung) ─────────
-  # Ke-6 fungsi ini di-deploy via update-function-code + update alias
-  # tanpa CodeDeploy agar tidak konflik deployment group
   deploy-lambda:
     name: Deploy Lambda ${{ matrix.function.name }}
     runs-on: ubuntu-latest
@@ -164,7 +162,6 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --query 'Version' --output text --no-cli-pager)
           echo "Published version: $VERSION"
-          # Cek apakah alias 'live' ada sebelum update (init-db tidak punya alias)
           ALIAS_EXISTS=$(aws lambda get-alias \
             --function-name "$FUNC_NAME" \
             --name live \
@@ -179,12 +176,16 @@ jobs:
               --no-cli-pager
             echo "Alias 'live' updated to v$VERSION for $FUNC_NAME"
           else
-            echo "No alias 'live' for $FUNC_NAME - skipping alias update (code updated)"
+            aws lambda create-alias \
+              --function-name "$FUNC_NAME" \
+              --name live \
+              --function-version "$VERSION" \
+              --region ${{ env.AWS_REGION }} \
+              --no-cli-pager
+            echo "Alias 'live' created v$VERSION for $FUNC_NAME"
           fi
 
   # ─── JOB 4: Deploy order-management via CodeDeploy (Blue/Green)
-  # Hanya fungsi utama ini yang pakai CodeDeploy Canary
-  # untuk demonstrasi Blue/Green deployment
   deploy-bluegreen:
     name: Deploy order-management (Blue/Green CodeDeploy)
     runs-on: ubuntu-latest
@@ -274,7 +275,6 @@ jobs:
       - name: Create CodeDeploy deployment (Canary Blue/Green)
         id: codedeploy
         run: |
-          # Stop active deployment jika ada, agar tidak DeploymentLimitExceededException
           ACTIVE=$(aws deploy list-deployments \
             --application-name "$APP_NAME" \
             --deployment-group-name "$DEPLOYMENT_GROUP" \
@@ -309,7 +309,9 @@ jobs:
             --region ${{ env.AWS_REGION }}
           echo "Blue/Green deployment successful!"
 
-  # ─── JOB 5: Deploy Frontend ──────────────────────────────────
+  # ─── JOB 5: Deploy Frontend via Amplify (manual zip deploy) ──
+  # Amplify app dibuat secara manual (zip upload), bukan connected ke Git.
+  # Wajib pakai create-deployment + start-deployment, BUKAN start-job.
   deploy-frontend:
     name: Deploy Frontend via Amplify
     runs-on: ubuntu-latest
@@ -329,73 +331,80 @@ jobs:
       - name: Validate frontend files
         run: |
           test -f frontend/index.html && echo "index.html OK"
-          test -f amplify.yml && echo "amplify.yml OK"
+          ls -lh frontend/
 
-      - name: Reset Amplify build spec to use amplify.yml from repo
+      - name: Package frontend zip
         run: |
-          # Paksa Amplify baca build settings dari amplify.yml di repo, bukan dari console
-          aws amplify update-app \
-            --app-id "${{ secrets.AMPLIFY_APP_ID }}" \
-            --region ${{ env.AWS_REGION }} \
-            --no-cli-pager \
-            --build-spec "version: 1\nfrontend:\n  phases:\n    preBuild:\n      commands:\n        - ls -la\n        - test -f frontend/index.html && echo OK || exit 1\n    build:\n      commands:\n        - echo done\n  artifacts:\n    baseDirectory: frontend\n    files:\n      - '**/*'" || true
-          echo "Build spec reset done"
+          cd frontend
+          zip -q /tmp/frontend.zip index.html
+          ls -lh /tmp/frontend.zip
 
-      - name: Trigger Amplify build
+      - name: Deploy to Amplify (create-deployment + start-deployment)
         id: amplify
         run: |
-          # Stop any pending/running jobs on this branch first
-          RUNNING=$(aws amplify list-jobs \
-            --app-id "${{ secrets.AMPLIFY_APP_ID }}" \
-            --branch-name ${{ github.ref_name }} \
-            --region ${{ env.AWS_REGION }} \
-            --query 'jobSummaries[?status==`RUNNING` || status==`PENDING`].jobId' \
-            --output text --no-cli-pager 2>/dev/null || echo "")
-          for JID in $RUNNING; do
-            echo "Stopping existing job: $JID"
-            aws amplify stop-job \
-              --app-id "${{ secrets.AMPLIFY_APP_ID }}" \
-              --branch-name ${{ github.ref_name }} \
-              --job-id "$JID" \
-              --region ${{ env.AWS_REGION }} \
-              --no-cli-pager || true
-          done
-          [ -n "$RUNNING" ] && sleep 5
-          JOB_ID=$(aws amplify start-job \
-            --app-id "${{ secrets.AMPLIFY_APP_ID }}" \
-            --branch-name ${{ github.ref_name }} \
-            --job-type RELEASE \
-            --commit-id "${{ github.sha }}" \
-            --commit-message "deploy ${{ github.sha }}" \
-            --region ${{ env.AWS_REGION }} \
-            --query 'jobSummary.jobId' --output text --no-cli-pager)
-          echo "JOB_ID=$JOB_ID" >> $GITHUB_OUTPUT
-          echo "Amplify Job: $JOB_ID"
+          APP_ID="${{ secrets.AMPLIFY_APP_ID }}"
+          BRANCH="main"
 
-      - name: Wait for Amplify build
+          # Pastikan branch ada
+          aws amplify create-branch \
+            --app-id "$APP_ID" \
+            --branch-name "$BRANCH" \
+            --region ${{ env.AWS_REGION }} \
+            --no-cli-pager 2>/dev/null || true
+
+          # create-deployment → dapat zipUploadUrl + jobId
+          DEPLOY_RESP=$(aws amplify create-deployment \
+            --app-id "$APP_ID" \
+            --branch-name "$BRANCH" \
+            --region ${{ env.AWS_REGION }} \
+            --output json)
+
+          UPLOAD_URL=$(echo "$DEPLOY_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['zipUploadUrl'])")
+          JOB_ID=$(echo      "$DEPLOY_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['jobId'])")
+          echo "JOB_ID=$JOB_ID" >> $GITHUB_OUTPUT
+          echo "Got jobId=$JOB_ID, uploading zip..."
+
+          # Upload zip via PUT ke pre-signed URL
+          HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
+            -X PUT "$UPLOAD_URL" \
+            -H "Content-Type: application/zip" \
+            --data-binary @/tmp/frontend.zip)
+          echo "Upload HTTP status: $HTTP_CODE"
+          [ "$HTTP_CODE" = "200" ] || (echo "Upload failed: $HTTP_CODE" && exit 1)
+
+          # start-deployment dengan jobId dari create-deployment
+          aws amplify start-deployment \
+            --app-id "$APP_ID" \
+            --branch-name "$BRANCH" \
+            --job-id "$JOB_ID" \
+            --region ${{ env.AWS_REGION }} \
+            --no-cli-pager
+          echo "Deployment started: job $JOB_ID"
+
+      - name: Wait for Amplify deployment
         run: |
           APP_ID="${{ secrets.AMPLIFY_APP_ID }}"
-          BRANCH="${{ github.ref_name }}"
+          BRANCH="main"
           JOB_ID="${{ steps.amplify.outputs.JOB_ID }}"
-          for i in $(seq 1 40); do
+          echo "Waiting for job $JOB_ID..."
+          for i in $(seq 1 30); do
             STATUS=$(aws amplify get-job \
               --app-id "$APP_ID" \
               --branch-name "$BRANCH" \
               --job-id "$JOB_ID" \
               --region ${{ env.AWS_REGION }} \
               --query 'job.summary.status' --output text --no-cli-pager)
-            echo "Attempt $i/40 - Status: $STATUS"
+            echo "[$i/30] Status: $STATUS"
             if [ "$STATUS" = "SUCCEED" ]; then
-              echo "Amplify build succeeded!"
-              AMPLIFY_URL=$(aws amplify get-branch \
-                --app-id "$APP_ID" --branch-name "$BRANCH" \
+              DOMAIN=$(aws amplify get-app \
+                --app-id "$APP_ID" \
                 --region ${{ env.AWS_REGION }} \
-                --query 'branch.displayName' --output text --no-cli-pager 2>/dev/null || echo "")
-              echo "Frontend URL: https://${BRANCH}.$(aws amplify get-app --app-id $APP_ID --region ${{ env.AWS_REGION }} --query 'app.defaultDomain' --output text --no-cli-pager 2>/dev/null || echo 'check-amplify-console')"
+                --query 'app.defaultDomain' --output text --no-cli-pager 2>/dev/null || echo "")
+              echo "Frontend URL: https://${BRANCH}.${DOMAIN}"
               exit 0
             fi
             if [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
-              echo "Amplify build $STATUS - fetching step details..."
+              echo "Amplify deployment $STATUS"
               aws amplify get-job \
                 --app-id "$APP_ID" \
                 --branch-name "$BRANCH" \
@@ -403,12 +412,11 @@ jobs:
                 --region ${{ env.AWS_REGION }} \
                 --query 'job.steps[?status==`FAILED`].[stepName,statusReason]' \
                 --output table --no-cli-pager 2>/dev/null || true
-              echo "Check full logs: AWS Console > Amplify > $APP_ID > $BRANCH > Job $JOB_ID"
               exit 1
             fi
-            sleep 30
+            sleep 15
           done
-          echo "Timeout - check Amplify console"
+          echo "Timeout waiting for Amplify"
           exit 1
 
   # ─── JOB 6: Notify ───────────────────────────────────────────
