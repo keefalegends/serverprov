@@ -80,6 +80,10 @@ usage() {
     echo "    5=Lambda    6=StepFunctions   7=APIGateway"
     echo "    8=EventBridge   9=CICD   10=InitDB   11=Verify"
     echo ""
+    echo "  Fix RDS timeout (jalankan tanpa rebuild layer):"
+    echo "    ./judge.sh deploy <nama> <email> 5  # fix VPC+SG lalu lanjut"
+    echo "    ./judge.sh deploy <nama> <email> 10 # re-run init_db saja"
+    echo ""
     exit 1
 }
 
@@ -551,6 +555,8 @@ log "From Step : $FROM_STEP"
 echo ""
 warn "Estimasi waktu: 40-50 menit"
 warn "⚠  Confirm SNS email subscription saat email tiba di inbox."
+warn "⚠  Jika RDS timeout: jalankan './judge.sh deploy $STUDENT_NAME $EMAIL 5' untuk fix VPC/SG"
+warn "⚠  Jika psycopg2 error: jalankan 'FORCE_LAYER=true ./judge.sh deploy $STUDENT_NAME $EMAIL 5'"
 echo ""
 
 # ================================================================
@@ -1000,17 +1006,56 @@ if ! skip_step 5; then
             log "  Lambda SG egress: allow-all outbound OK ($_SG_LAMBDA)"
         fi
 
-        # Fix RDS SG juga — allow dari Lambda SG dan seluruh VPC
+        # ── Fix RDS SG — allow dari Lambda SG dan seluruh VPC ──────────
         _SG_RDS=$(aws ec2 describe-security-groups \
             --filters "Name=group-name,Values=${PROJECT}-sg-rds" \
             --query "SecurityGroups[0].GroupId" --output text --region "$REGION" 2>/dev/null || echo "")
         if [ -n "$_SG_RDS" ] && [ "$_SG_RDS" != "None" ]; then
+            # Allow dari 0.0.0.0/0 (paling luas — untuk memastikan koneksi)
             aws ec2 authorize-security-group-ingress \
                 --group-id "$_SG_RDS" --protocol tcp --port 5432 --port 5432 \
                 --cidr 0.0.0.0/0 \
                 --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
-            log "  RDS SG ingress: allow port 5432 from 0.0.0.0/0 OK"
+            # Allow dari Lambda SG (source group)
+            if [ -n "$_SG_LAMBDA" ] && [ "$_SG_LAMBDA" != "None" ]; then
+                aws ec2 authorize-security-group-ingress \
+                    --group-id "$_SG_RDS" --protocol tcp --port 5432 --port 5432 \
+                    --source-group "$_SG_LAMBDA" \
+                    --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+            fi
+            log "  RDS SG ingress: allow port 5432 OK ($_SG_RDS)"
         fi
+
+        # ── Pastikan Lambda functions pakai VPC config yang SAMA dengan RDS ──
+        # RDS ada di private subnet — Lambda HARUS di subnet yang bisa reach RDS
+        # Cek apakah Lambda sudah punya VPC config
+        log "  Verifying Lambda VPC config..."
+        _PRIV_SN1=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='${PROJECT}-private-subnet-1'].Value" \
+            --output text --region "$REGION" 2>/dev/null || echo "")
+        _PRIV_SN2=$(aws cloudformation list-exports \
+            --query "Exports[?Name=='${PROJECT}-private-subnet-2'].Value" \
+            --output text --region "$REGION" 2>/dev/null || echo "")
+
+        for _FN in techno-lambda-order-management techno-lambda-init-db techno-lambda-health-check \
+                   techno-lambda-process-payment techno-lambda-update-inventory techno-lambda-generate-report; do
+            _CURRENT_VPC=$(aws lambda get-function-configuration \
+                --function-name "$_FN" --region "$REGION" \
+                --query "VpcConfig.VpcId" --output text 2>/dev/null || echo "")
+            if [ -z "$_CURRENT_VPC" ] || [ "$_CURRENT_VPC" = "None" ]; then
+                log "    $_FN: tidak ada VPC config — menambahkan..."
+                aws lambda update-function-configuration \
+                    --function-name "$_FN" \
+                    --vpc-config "SubnetIds=${_PRIV_SN1},${_PRIV_SN2},SecurityGroupIds=${_SG_LAMBDA}" \
+                    --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+                aws lambda wait function-updated \
+                    --function-name "$_FN" --region "$REGION" 2>/dev/null || true
+                log "    VPC config added: $_FN"
+            else
+                log "    $_FN: sudah ada VPC config ($_CURRENT_VPC) ✓"
+            fi
+        done
+        ok "Lambda VPC config verified"
 
         LAYER_DIR="/tmp/techno_layer"
         REQUIREMENTS_FILE="${SCRIPT_DIR}/lambda/requirements.txt"
@@ -1999,10 +2044,16 @@ if ! skip_step 10; then
         INIT_RESULT=$(cat /tmp/techno_init_result.json 2>/dev/null || echo "")
         log "  Result: $(echo "$INIT_RESULT" | head -c 300)"
 
-        if echo "$INIT_RESULT" | grep -q "psycopg2\|ImportModule"; then
+        if echo "$INIT_RESULT" | grep -q "No module named\|ImportModuleError\|Cannot import"; then
             err "Layer psycopg2 masih error. Jalankan: FORCE_LAYER=true ./judge.sh deploy $STUDENT_NAME $EMAIL 5"
+        elif echo "$INIT_RESULT" | grep -q "timeout expired\|could not connect\|Connection refused\|OperationalError"; then
+            warn "  RDS belum bisa direach (timeout). Tunggu 20 detik..."
+            sleep 20
+        elif echo "$INIT_RESULT" | grep -q "KeyError.*SECRET_ARN\|\'SECRET_ARN\'"; then
+            warn "  SECRET_ARN env var belum set. Jalankan step 4+5 dulu."
+            break
         elif echo "$INIT_RESULT" | grep -q "errorType\|errorMessage"; then
-            warn "  Lambda error — tunggu 15 detik lalu retry..."
+            warn "  Lambda error lain — tunggu 15 detik lalu retry..."
             sleep 15
         elif echo "$INIT_RESULT" | grep -q "Schema created\|results\|200"; then
             INIT_OK=true
