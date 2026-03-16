@@ -138,6 +138,9 @@ jobs:
           zip -q /tmp/${FUNC_NAME}.zip lambda_function.py
 
       - name: Upload zip to S3
+        # S3 upload adalah opsional (arsip artifact). Lambda diupdate langsung
+        # via --zip-file di step berikutnya, jadi AccessDenied di sini tidak fatal.
+        continue-on-error: true
         run: |
           aws s3 cp /tmp/${FUNC_NAME}.zip \
             "s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/lambda/${FUNC_NAME}/${{ github.sha }}.zip" \
@@ -209,6 +212,9 @@ jobs:
           echo "Packaged order-management"
 
       - name: Upload zip to S3
+        # S3 upload adalah opsional (arsip artifact). Lambda diupdate langsung
+        # via --zip-file di step berikutnya, jadi AccessDenied di sini tidak fatal.
+        continue-on-error: true
         run: |
           aws s3 cp /tmp/techno-lambda-order-management.zip \
             "s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/lambda/techno-lambda-order-management/${{ github.sha }}.zip" \
