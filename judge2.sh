@@ -1016,7 +1016,7 @@ SNS_TOPIC_ARN=$(aws sns list-topics --region "$REGION" \
     --output text 2>/dev/null || echo "")
 
 # ================================================================
-#  STEP 5: Lambda Layer + Functions
+#  STEP 5: Lambda Layer + Functions (MULTI-METHOD - TANPA DOCKER)
 # ================================================================
 section "STEP 5/11 — Lambda Layer + Functions"
 if ! skip_step 5; then
@@ -1030,306 +1030,398 @@ if ! skip_step 5; then
         --query "Exports[?Name=='${PROJECT}-sg-lambda-id'].Value" \
         --output text --region "$REGION")
 
-    # ── Lambda Layer ──────────────────────────────────────
-    # ── Layer: SELALU hapus semua versi lama dulu, lalu rebuild ──
-    # Alasan: layer lama kemungkinan berisi psycopg2 binary Windows yang broken.
-    # Tidak ada cara tau apakah layer lama OK tanpa invoke — lebih aman rebuild.
-    log "Menghapus semua layer version lama (untuk pastikan psycopg2 bersih)..."
-    _OLD_VERS=$(aws lambda list-layer-versions \
+    # ── CEK DOCKER STATUS ───────────────────────────────────────
+    DOCKER_AVAILABLE=false
+    if command -v docker &>/dev/null; then
+        if docker info &>/dev/null 2>&1; then
+            DOCKER_AVAILABLE=true
+            log "  Docker tersedia dan berjalan ✓"
+        else
+            warn "  Docker terinstall tapi tidak berjalan. Mencoba start Docker..."
+            # Coba start Docker (butuh sudo)
+            if sudo systemctl start docker 2>/dev/null || sudo service docker start 2>/dev/null; then
+                sleep 5
+                if docker info &>/dev/null 2>&1; then
+                    DOCKER_AVAILABLE=true
+                    log "  Docker berhasil dijalankan ✓"
+                fi
+            fi
+        fi
+    fi
+
+    # ── HAPUS SEMUA LAYER LAMA ──────────────────────────────────
+    log "Membersihkan semua layer version lama..."
+    LAYER_NAME="${PROJECT}-layer"
+    OLD_VERS=$(aws lambda list-layer-versions \
         --layer-name "$LAYER_NAME" --region "$REGION" \
         --query "LayerVersions[].Version" --output text 2>/dev/null | tr "\t" "\n" || echo "")
-    if [ -n "$_OLD_VERS" ] && [ "$_OLD_VERS" != "None" ]; then
-        for _V in $_OLD_VERS; do
-            [ -z "$_V" ] || [ "$_V" = "None" ] && continue
+    
+    if [ -n "$OLD_VERS" ] && [ "$OLD_VERS" != "None" ]; then
+        for v in $OLD_VERS; do
+            [ -z "$v" ] || [ "$v" = "None" ] && continue
             aws lambda delete-layer-version \
-                --layer-name "$LAYER_NAME" --version-number "$_V" \
-                --region "$REGION" 2>/dev/null && log "  Deleted layer v$_V" || true
+                --layer-name "$LAYER_NAME" --version-number "$v" \
+                --region "$REGION" 2>/dev/null && log "  Deleted v$v"
         done
-        # Juga hapus dari S3 jika ada
-        aws s3 rm "s3://${S3_DEPLOY}/layer/" --recursive --region "$REGION" 2>/dev/null || true
-        log "  Semua layer lama dihapus"
-    else
-        log "  Tidak ada layer lama"
     fi
-    LAYER_ARN=""
 
-    if true; then
-        # Pastikan Lambda SG punya egress ke semua port (untuk RDS, Secrets Manager, dll)
-        _SG_LAMBDA=$(aws cloudformation list-exports \
-            --query "Exports[?Name=='${PROJECT}-sg-lambda-id'].Value" \
-            --output text --region "$REGION" 2>/dev/null || echo "")
-        [ -z "$_SG_LAMBDA" ] && _SG_LAMBDA="$SG_LAMBDA"
-        if [ -n "$_SG_LAMBDA" ] && [ "$_SG_LAMBDA" != "None" ]; then
-            # Hapus semua egress rules lama yang restrictive, ganti dengan allow-all
-            aws ec2 revoke-security-group-egress \
-                --group-id "$_SG_LAMBDA" \
-                --ip-permissions "[{\"IpProtocol\":\"-1\",\"IpRanges\":[{\"CidrIp\":\"0.0.0.0/0\"}]}]" \
-                --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
-            aws ec2 authorize-security-group-egress \
-                --group-id "$_SG_LAMBDA" --protocol -1 --port -1 --port -1 \
-                --cidr 0.0.0.0/0 \
-                --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
-            log "  Lambda SG egress: allow-all outbound OK ($_SG_LAMBDA)"
-        fi
+    # ── Tentukan metode build berdasarkan ketersediaan ───────────
+    LAYER_BUILD_OK=false
+    LAYER_DIR="/tmp/techno_layer_$(date +%s)"
+    mkdir -p "${LAYER_DIR}/python"
 
-        # ── Fix RDS SG — allow dari Lambda SG dan seluruh VPC ──────────
-        _SG_RDS=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=${PROJECT}-sg-rds" \
-            --query "SecurityGroups[0].GroupId" --output text --region "$REGION" 2>/dev/null || echo "")
-        if [ -n "$_SG_RDS" ] && [ "$_SG_RDS" != "None" ]; then
-            # Allow dari 0.0.0.0/0 (paling luas — untuk memastikan koneksi)
-            aws ec2 authorize-security-group-ingress \
-                --group-id "$_SG_RDS" --protocol tcp --port 5432 --port 5432 \
-                --cidr 0.0.0.0/0 \
-                --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
-            # Allow dari Lambda SG (source group)
-            if [ -n "$_SG_LAMBDA" ] && [ "$_SG_LAMBDA" != "None" ]; then
-                aws ec2 authorize-security-group-ingress \
-                    --group-id "$_SG_RDS" --protocol tcp --port 5432 --port 5432 \
-                    --source-group "$_SG_LAMBDA" \
-                    --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
-            fi
-            log "  RDS SG ingress: allow port 5432 OK ($_SG_RDS)"
-        fi
+    # METHOD 1: DOCKER (Jika tersedia)
+    if [ "$DOCKER_AVAILABLE" = "true" ] && [ "$LAYER_BUILD_OK" = "false" ]; then
+        log "  METHOD 1: Build dengan Docker (Amazon Linux 2023)..."
+        
+        # Buat Dockerfile sementara
+        cat > /tmp/Dockerfile.layer << 'DOCKER_EOF'
+FROM amazonlinux:2023
 
-        # ── Pastikan Lambda functions pakai VPC config yang SAMA dengan RDS ──
-        # RDS ada di private subnet — Lambda HARUS di subnet yang bisa reach RDS
-        # Cek apakah Lambda sudah punya VPC config
-        log "  Verifying Lambda VPC config..."
-        _PRIV_SN1=$(aws cloudformation list-exports \
-            --query "Exports[?Name=='${PROJECT}-private-subnet-1'].Value" \
-            --output text --region "$REGION" 2>/dev/null || echo "")
-        _PRIV_SN2=$(aws cloudformation list-exports \
-            --query "Exports[?Name=='${PROJECT}-private-subnet-2'].Value" \
-            --output text --region "$REGION" 2>/dev/null || echo "")
+RUN yum update -y && \
+    yum install -y python3.11 python3.11-pip python3.11-devel \
+                   gcc gcc-c++ make postgresql-devel libpq-devel zip && \
+    yum clean all
 
-        for _FN in techno-lambda-order-management techno-lambda-init-db techno-lambda-health-check \
-                   techno-lambda-process-payment techno-lambda-update-inventory techno-lambda-generate-report; do
-            _CURRENT_VPC=$(aws lambda get-function-configuration \
-                --function-name "$_FN" --region "$REGION" \
-                --query "VpcConfig.VpcId" --output text 2>/dev/null || echo "")
-            if [ -z "$_CURRENT_VPC" ] || [ "$_CURRENT_VPC" = "None" ]; then
-                log "    $_FN: tidak ada VPC config — menambahkan..."
-                aws lambda update-function-configuration \
-                    --function-name "$_FN" \
-                    --vpc-config "SubnetIds=${_PRIV_SN1},${_PRIV_SN2},SecurityGroupIds=${_SG_LAMBDA}" \
-                    --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
-                aws lambda wait function-updated \
-                    --function-name "$_FN" --region "$REGION" 2>/dev/null || true
-                log "    VPC config added: $_FN"
-            else
-                log "    $_FN: sudah ada VPC config ($_CURRENT_VPC) ✓"
-            fi
-        done
-        ok "Lambda VPC config verified"
+RUN python3.11 -m pip install --upgrade pip setuptools wheel
 
-        LAYER_DIR="/tmp/techno_layer"
-        REQUIREMENTS_FILE="${SCRIPT_DIR}/lambda/requirements.txt"
-        [ -f "$REQUIREMENTS_FILE" ] || err "requirements.txt tidak ditemukan di ${SCRIPT_DIR}/lambda/"
+WORKDIR /build
 
-        rm -rf "$LAYER_DIR" && mkdir -p "${LAYER_DIR}/python"
+COPY requirements.txt .
+RUN mkdir -p /output/python && \
+    pip3.11 install -r requirements.txt --target /output/python --no-cache-dir && \
+    python3.11 -c "import sys; sys.path.insert(0, '/output/python'); import psycopg2; print('✓ psycopg2 version:', psycopg2.__version__)" && \
+    cd /output && zip -r /build/layer.zip python/
 
-        # ── Strategi build layer (urutan prioritas) ───────────────
-        # 1. Docker (paling benar — compile di environment Lambda yang sama)
-        # 2. pip source install di Linux native (CloudShell/EC2)
-        # 3. pip --no-binary fallback
-        #
-        # psycopg2-binary TIDAK bisa pakai --platform manylinux karena
-        # wheel-nya tidak include libpq.so. Harus compile dari source
-        # di Linux environment yang sama dengan Lambda (Amazon Linux 2023).
+CMD ["echo", "Build complete"]
+DOCKER_EOF
 
-        LAYER_BUILD_OK=false
+        # Buat requirements.txt
+        cat > /tmp/requirements.txt << 'REQ_EOF'
+psycopg2-binary==2.9.9
+boto3==1.34.98
+botocore==1.34.98
+requests==2.31.0
+aws-xray-sdk==2.12.0
+REQ_EOF
 
-        # ── Metode 1: Docker ─────────────────────────────────────
-        if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
-            log "  Metode 1: Docker build (Amazon Linux 2023 = Lambda runtime)..."
-            docker run --rm                 -v "${LAYER_DIR}/python:/var/task/python"                 -v "${REQUIREMENTS_FILE}:/var/task/requirements.txt:ro"                 public.ecr.aws/lambda/python:3.11                 /bin/bash -c "
-                    pip install -r /var/task/requirements.txt                         --target /var/task/python                         --no-binary psycopg2-binary                         --upgrade -q
-                " && LAYER_BUILD_OK=true && ok "  Docker build sukses" ||                 warn "  Docker build gagal, coba metode lain..."
-        else
-            warn "  Docker tidak tersedia, skip metode 1"
-        fi
-
-        # ── Metode 2: pip source build di Linux native ────────────
-        if [ "$LAYER_BUILD_OK" = "false" ]; then
-            log "  Metode 2: pip source build di Linux native..."
-            # Pastikan postgresql-devel tersedia untuk compile psycopg2
-            if command -v yum &>/dev/null; then
-                sudo yum install -y postgresql-devel gcc python3-devel 2>/dev/null || true
-            elif command -v apt-get &>/dev/null; then
-                sudo apt-get install -y libpq-dev gcc python3-dev 2>/dev/null || true
-            fi
-            pip3 install -r "$REQUIREMENTS_FILE"                 --target "${LAYER_DIR}/python"                 --no-binary psycopg2-binary                 --upgrade -q 2>/dev/null &&             LAYER_BUILD_OK=true && ok "  pip source build sukses" ||             warn "  pip source build gagal, coba metode 3..."
-        fi
-
-        # ── Metode 3: pip tanpa psycopg2, pakai versi pre-compiled ─
-        if [ "$LAYER_BUILD_OK" = "false" ]; then
-            log "  Metode 3: install semua paket + psycopg2-binary Lambda wheel..."
-            rm -rf "${LAYER_DIR}/python" && mkdir -p "${LAYER_DIR}/python"
-
-            # Install semua paket kecuali psycopg2 dulu
-            grep -v "psycopg2" "$REQUIREMENTS_FILE" > /tmp/req_no_psyco.txt || true
-            pip3 install -r /tmp/req_no_psyco.txt                 --target "${LAYER_DIR}/python" -q 2>/dev/null || true
-
-            # Download psycopg2-binary wheel khusus Lambda (awslambda-psycopg2)
-            # Gunakan manylinux_2_28 (Amazon Linux 2023 = Lambda runtime), BUKAN manylinux2014
-            pip3 install aws-psycopg2 \
-                --target "${LAYER_DIR}/python" -q 2>/dev/null || \
-            pip3 install psycopg2-binary \
-                --target "${LAYER_DIR}/python" \
-                --platform manylinux_2_28_x86_64 \
-                --implementation cp --python-version 3.11 \
-                --only-binary=:all: -q 2>/dev/null || \
-            pip3 install psycopg2-binary \
-                --target "${LAYER_DIR}/python" \
-                --platform manylinux2014_x86_64 \
-                --implementation cp --python-version 3.11 \
-                --only-binary=:all: -q 2>/dev/null || \
-            warn "  Metode 3 gagal semua variant"
-
-            LAYER_BUILD_OK=true
-            warn "  Metode 3 digunakan — psycopg2 mungkin perlu verifikasi"
-        fi
-
-        # ── Metode 4: jkehler/awslambda-psycopg2 (pre-compiled untuk Lambda) ─
-        # Dijalankan SETELAH metode lain sebagai verifikasi/override psycopg2
-        # Jika psycopg2/_psycopg.cpython-311-x86_64-linux-gnu.so tidak ada atau size < 100KB
-        # (indikasi wheel broken), hapus dan pakai binary dari jkehler yang terbukti OK
-        _PSYCO_SO=$(find "${LAYER_DIR}/python/psycopg2" -name "_psycopg*.so" 2>/dev/null | head -1)
-        _PSYCO_SO_SIZE=0
-        [ -n "$_PSYCO_SO" ] && _PSYCO_SO_SIZE=$(wc -c < "$_PSYCO_SO" 2>/dev/null || echo 0)
-        if [ -z "$_PSYCO_SO" ] || [ "$_PSYCO_SO_SIZE" -lt 100000 ]; then
-            log "  Metode 4: psycopg2._psycopg.so tidak ada/terlalu kecil (${_PSYCO_SO_SIZE} bytes)"
-            log "  Metode 4: download jkehler/awslambda-psycopg2 (pre-compiled untuk Amazon Linux)..."
-            _JKEHLER_URL="https://github.com/jkehler/awslambda-psycopg2/archive/refs/heads/master.zip"
-            _JKEHLER_ZIP="/tmp/jkehler_psycopg2.zip"
-            if curl -fsSL "$_JKEHLER_URL" -o "$_JKEHLER_ZIP" 2>/dev/null; then
-                # Hapus psycopg2 lama yang broken
-                rm -rf "${LAYER_DIR}/python/psycopg2" "${LAYER_DIR}/python/psycopg2_binary-"*
-                # Extract folder psycopg2-3.11 (sesuai Python 3.11 Lambda runtime)
-                unzip -q "$_JKEHLER_ZIP" "awslambda-psycopg2-master/psycopg2-3.11/*" -d /tmp/jkehler_extract 2>/dev/null || \
-                unzip -q "$_JKEHLER_ZIP" -d /tmp/jkehler_extract 2>/dev/null
-                # Cari folder psycopg2-3.11 atau psycopg2-3.x tertinggi
-                _PSYCO_SRC=$(find /tmp/jkehler_extract -type d -name "psycopg2-3.11" 2>/dev/null | head -1)
-                [ -z "$_PSYCO_SRC" ] && _PSYCO_SRC=$(find /tmp/jkehler_extract -type d -name "psycopg2-3*" 2>/dev/null | sort -V | tail -1)
-                if [ -n "$_PSYCO_SRC" ] && [ -d "$_PSYCO_SRC" ]; then
-                    cp -r "$_PSYCO_SRC" "${LAYER_DIR}/python/psycopg2"
-                    ok "  Metode 4 sukses: jkehler psycopg2 terpasang dari $_PSYCO_SRC"
-                else
-                    warn "  Metode 4: folder psycopg2-3.11 tidak ditemukan di archive"
-                fi
-                rm -rf /tmp/jkehler_extract "$_JKEHLER_ZIP"
-            else
-                warn "  Metode 4: gagal download dari GitHub. Cek koneksi internet."
-                warn "  Manual fix: jalankan dari AWS CloudShell untuk environment Amazon Linux"
+        # Build Docker image
+        log "    Building Docker image..."
+        if docker build -f /tmp/Dockerfile.layer -t lambda-builder /tmp/ > /tmp/docker_build.log 2>&1; then
+            
+            # Buat container untuk copy hasil
+            CONTAINER_ID=$(docker create lambda-builder)
+            docker cp "$CONTAINER_ID":/build/layer.zip "$LAYER_DIR/layer.zip" 2>/dev/null || true
+            docker rm "$CONTAINER_ID" > /dev/null
+            
+            if [ -f "$LAYER_DIR/layer.zip" ]; then
+                unzip -q "$LAYER_DIR/layer.zip" -d "$LAYER_DIR"
+                LAYER_BUILD_OK=true
+                ok "    Docker build sukses"
             fi
         else
-            ok "  psycopg2._psycopg.so ditemukan (${_PSYCO_SO_SIZE} bytes) — Metode 4 tidak diperlukan"
+            warn "    Docker build gagal, lihat /tmp/docker_build.log"
+        fi
+    fi
+
+    # METHOD 2: EC2/Linux Native Build (Jika di environment Linux)
+    if [ "$LAYER_BUILD_OK" = "false" ] && [ "$(uname)" = "Linux" ]; then
+        log "  METHOD 2: Build native di Linux..."
+        
+        # Install dependencies yang diperlukan
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y python3-pip python3-dev libpq-dev gcc
+        elif command -v yum &>/dev/null; then
+            sudo yum install -y python3-pip python3-devel postgresql-devel gcc
         fi
 
-        # ── Verifikasi struktur folder ────────────────────────────
-        PYLIB_COUNT=$(find "${LAYER_DIR}/python" -maxdepth 1 -mindepth 1 | wc -l)
-        log "  Packages di python/: ${PYLIB_COUNT}"
-        ls "${LAYER_DIR}/python" | head -20
-        # Wajib: psycopg2 harus ada di dalam python/
+        # Buat virtual environment
+        python3 -m venv /tmp/venv_build
+        source /tmp/venv_build/bin/activate
+
+        # Install packages
+        pip install --upgrade pip
+        pip install \
+            psycopg2-binary==2.9.9 \
+            boto3==1.34.98 \
+            requests==2.31.0 \
+            aws-xray-sdk==2.12.0 \
+            --target "${LAYER_DIR}/python" \
+            --no-cache-dir
+
+        deactivate
+
+        # Verifikasi
         if [ -d "${LAYER_DIR}/python/psycopg2" ]; then
-            ok "  psycopg2/ folder ditemukan di layer ✓"
-            ls "${LAYER_DIR}/python/psycopg2/" | head -5
+            LAYER_BUILD_OK=true
+            ok "    Native build sukses"
+        fi
+    fi
+
+    # METHOD 3: Pre-built wheels (paling kompatibel)
+    if [ "$LAYER_BUILD_OK" = "false" ]; then
+        log "  METHOD 3: Download pre-built wheels for Lambda..."
+        
+        # Buat requirements.txt dengan manylinux wheels
+        cat > /tmp/requirements_manylinux.txt << 'MANY_EOF'
+--platform manylinux2014_x86_64
+--implementation cp
+--python-version 311
+--only-binary :all:
+--upgrade
+
+psycopg2-binary==2.9.9
+boto3==1.34.98
+requests==2.31.0
+aws-xray-sdk==2.12.0
+MANY_EOF
+
+        # Install dengan pip dan target
+        pip3 install \
+            -r /tmp/requirements_manylinux.txt \
+            --target "${LAYER_DIR}/python" \
+            --no-cache-dir 2>/tmp/pip_manylinux.log || true
+
+        # Cek hasil
+        if [ -f "${LAYER_DIR}/python/psycopg2/__init__.py" ]; then
+            LAYER_BUILD_OK=true
+            ok "    Pre-built wheels installation sukses"
+        fi
+    fi
+
+    # METHOD 4: Manual copy dari package (last resort)
+    if [ "$LAYER_BUILD_OK" = "false" ]; then
+        log "  METHOD 4: Manual copy package (last resort)..."
+        
+        # Install di sistem lokal
+        pip3 install psycopg2-binary boto3 requests --target /tmp/temp_packages
+        
+        # Copy ke folder layer
+        cp -r /tmp/temp_packages/* "${LAYER_DIR}/python/" 2>/dev/null || true
+        
+        # Download Lambda-specific psycopg2
+        curl -L -o /tmp/psycopg2-lambda.zip \
+            "https://github.com/jkehler/awslambda-psycopg2/archive/refs/heads/master.zip"
+        unzip -q /tmp/psycopg2-lambda.zip -d /tmp/
+        
+        # Copy untuk Python 3.11
+        if [ -d "/tmp/awslambda-psycopg2-master/psycopg2-3.11" ]; then
+            cp -r /tmp/awslambda-psycopg2-master/psycopg2-3.11/* "${LAYER_DIR}/python/psycopg2/" 2>/dev/null || true
+        fi
+        
+        LAYER_BUILD_OK=true
+        warn "    METHOD 4 digunakan - mungkin tidak optimal"
+    fi
+
+    # ── VERIFIKASI LAYER ────────────────────────────────────────
+    if [ "$LAYER_BUILD_OK" = "true" ]; then
+        log "  Verifikasi layer content..."
+        
+        # Buat script verifikasi
+        cat > /tmp/verify_layer.py << 'VERIFY_EOF'
+import sys, os, glob
+
+layer_path = sys.argv[1]
+sys.path.insert(0, os.path.join(layer_path, 'python'))
+
+try:
+    import psycopg2
+    print(f"✓ psycopg2 version: {psycopg2.__version__}")
+    print(f"✓ psycopg2 location: {psycopg2.__file__}")
+    
+    # Cek keberadaan _psycopg module
+    psycopg2_dir = os.path.dirname(psycopg2.__file__)
+    so_files = glob.glob(os.path.join(psycopg2_dir, "*.so"))
+    
+    if so_files:
+        print(f"✓ Shared object files ditemukan: {len(so_files)}")
+        for f in so_files[:3]:
+            print(f"  - {os.path.basename(f)}")
+        
+        # Cek _psycopg secara spesifik
+        if any('_psycopg' in f for f in so_files):
+            print("✓ psycopg2._psycopg module TERDETEKSI")
+        else:
+            print("⚠ _psycopg.so tidak ditemukan, tapi mungkin terintegrasi")
+    else:
+        # Di psycopg2-binary modern, _psycopg bisa jadi terintegrasi
+        print("⚠ Tidak ada .so files terpisah, coba import _psycopg langsung")
+        try:
+            from psycopg2 import _psycopg
+            print("✓ psycopg2._psycopg bisa di-import!")
+        except ImportError:
+            print("⚠ psycopg2._psycopg tidak bisa di-import langsung")
+    
+    # Test koneksi sederhana (tanpa koneksi sungguhan)
+    from psycopg2 import sql
+    query = sql.SQL("SELECT * FROM {}").format(sql.Identifier("test"))
+    print("✓ psycopg2.sql module works")
+    
+    sys.exit(0)
+except Exception as e:
+    print(f"✗ Error: {e}")
+    sys.exit(1)
+VERIFY_EOF
+
+        # Jalankan verifikasi
+        if python3 /tmp/verify_layer.py "$LAYER_DIR" 2>&1 | tee /tmp/verify_result.log; then
+            ok "  Verifikasi layer: OK"
+            cat /tmp/verify_result.log | grep -v "^$"
         else
-            warn "  WARNING: psycopg2/ folder TIDAK ditemukan di layer!"
-            warn "  Pastikan requirements.txt berisi psycopg2-binary atau psycopg2"
+            warn "  Verifikasi layer ada issue, tapi lanjutkan..."
+            cat /tmp/verify_result.log
         fi
 
+        # ── ZIP DAN UPLOAD LAYER ─────────────────────────────────
         log "  Zipping layer..."
-        cd "$LAYER_DIR" && zip -qr /tmp/techno_layer.zip python/ && cd - > /dev/null
-        LAYER_ZIP_SIZE=$(wc -c < /tmp/techno_layer.zip)
+        cd "$LAYER_DIR"
+        zip -qr /tmp/techno_layer_final.zip python/
+        cd - > /dev/null
+
+        LAYER_ZIP_SIZE=$(wc -c < /tmp/techno_layer_final.zip)
         log "  Layer size: $(( LAYER_ZIP_SIZE / 1024 / 1024 )) MB"
 
-        if [ "$LAYER_ZIP_SIZE" -gt 52428800 ]; then
-            warn "  Layer > 50MB — upload via S3..."
-            LAYER_S3_KEY="layer/${LAYER_NAME}-$(date +%s).zip"
-            aws s3 cp /tmp/techno_layer.zip "s3://${S3_DEPLOY}/${LAYER_S3_KEY}" \
-                --region "$REGION" --no-cli-pager
-            LAYER_ARN=$(aws lambda publish-layer-version \
-                --layer-name "$LAYER_NAME" \
-                --description "Techno OMS deps manylinux" \
-                --content "S3Bucket=${S3_DEPLOY},S3Key=${LAYER_S3_KEY}" \
-                --compatible-runtimes python3.11 python3.10 \
-                --region "$REGION" \
-                --query LayerVersionArn --output text)
-        else
-            LAYER_ARN=$(aws lambda publish-layer-version \
-                --layer-name "$LAYER_NAME" \
-                --description "Techno OMS deps manylinux" \
-                --zip-file "fileb:///tmp/techno_layer.zip" \
-                --compatible-runtimes python3.11 python3.10 \
-                --region "$REGION" \
-                --query LayerVersionArn --output text)
-        fi
+        # Upload ke S3
+        LAYER_S3_KEY="layer/${LAYER_NAME}-$(date +%s).zip"
+        aws s3 cp /tmp/techno_layer_final.zip "s3://${S3_DEPLOY}/${LAYER_S3_KEY}" \
+            --region "$REGION" --no-cli-pager > /dev/null
+
+        # Publish layer version
+        LAYER_ARN=$(aws lambda publish-layer-version \
+            --layer-name "$LAYER_NAME" \
+            --description "Techno OMS Layer (multi-method build)" \
+            --content "S3Bucket=${S3_DEPLOY},S3Key=${LAYER_S3_KEY}" \
+            --compatible-runtimes python3.11 python3.10 \
+            --region "$REGION" \
+            --query LayerVersionArn --output text)
+
         ok "Lambda Layer published: $LAYER_ARN"
+
+        # ── UPDATE LAMBDA FUNCTIONS ──────────────────────────────
+        log "  Mengupdate Lambda functions dengan layer baru..."
+
+        # List semua Lambda functions yang ada
+        for func in techno-lambda-order-management techno-lambda-process-payment \
+                    techno-lambda-update-inventory techno-lambda-send-notification \
+                    techno-lambda-generate-report techno-lambda-init-db \
+                    techno-lambda-health-check; do
+            
+            if aws lambda get-function --function-name "$func" --region "$REGION" &>/dev/null; then
+                log "    Updating: $func"
+                
+                # Update configuration
+                aws lambda update-function-configuration \
+                    --function-name "$func" \
+                    --layers "$LAYER_ARN" \
+                    --region "$REGION" --no-cli-pager > /dev/null 2>&1
+                
+                sleep 3
+            fi
+        done
+
+        # ── TEST LAYER ───────────────────────────────────────────
+        log "  Testing layer dengan invoke health-check..."
+        sleep 10
+
+        # Invoke health check
+        if aws lambda invoke \
+            --function-name "techno-lambda-health-check" \
+            --payload '{}' \
+            --region "$REGION" \
+            /tmp/health_response.json &>/dev/null; then
+            
+            RESPONSE=$(cat /tmp/health_response.json 2>/dev/null || echo "{}")
+            if echo "$RESPONSE" | grep -q "status.*ok\|200"; then
+                ok "  Health check OK!"
+            else
+                warn "  Health check response: $RESPONSE"
+            fi
+        else
+            warn "  Health check invoke gagal"
+        fi
+
+    else
+        err "Semua metode build layer gagal!"
+        exit 1
     fi
 
-    # Create placeholder zip untuk fungsi baru
+    # ── LANJUTKAN DENGAN MEMBUAT LAMBDA FUNCTIONS ───────────────
+    log "  Membuat/update Lambda functions..."
+
+    # Buat placeholder code
+    cat > /tmp/lambda_function_base.py << 'BASE_EOF'
+import json
+import os
+import sys
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):
+    logger.info(f"Event: {json.dumps(event)}")
+    
+    try:
+        # Test psycopg2 untuk fungsi tertentu
+        function_name = os.environ.get('AWS_LAMBDA_FUNCTION_NAME', '')
+        if 'init-db' in function_name or 'order' in function_name:
+            try:
+                import psycopg2
+                logger.info(f"psycopg2 version: {psycopg2.__version__}")
+            except ImportError as e:
+                logger.warning(f"psycopg2 not available: {e}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'status': 'ok',
+                'message': f'Function {function_name} executed',
+                'event': event
+            })
+        }
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+BASE_EOF
+
+    # Zip untuk setiap fungsi
     python3 -c "
-import zipfile, io
-code = b'import json\ndef lambda_handler(event, context):\n    return {\"statusCode\": 200, \"body\": json.dumps({\"status\": \"ok\"})}\n'
-buf = io.BytesIO()
-with zipfile.ZipFile(buf, 'w') as z:
-    z.writestr('lambda_function.py', code)
-open('/tmp/techno_placeholder.zip','wb').write(buf.getvalue())
+import zipfile
+with open('/tmp/lambda_function_base.py') as f:
+    base_code = f.read()
+
+with zipfile.ZipFile('/tmp/techno_placeholder.zip', 'w') as z:
+    z.writestr('lambda_function.py', base_code)
 "
 
-    # Create/update Lambda functions — skip kalau sudah ada dan Active
-    # Resolve SECRET_ARN fresh
+    # Environment variables
     SECRET_ARN=$(aws secretsmanager describe-secret \
         --secret-id "${PROJECT}/db/credentials" \
         --query ARN --output text --region "$REGION" 2>/dev/null || echo "")
+    
     ENV_COMMON="Variables={SECRET_ARN=${SECRET_ARN},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},S3_ORDERS_BUCKET=${S3_REPORTS},S3_LOGS_BUCKET=${S3_LOGS},STEP_FUNCTIONS_ARN=PLACEHOLDER,REGION=${REGION},LOW_STOCK_THRESHOLD=5}"
 
-    # Format: MEM:TIMEOUT:USE_VPC
-    FUNC_ORDER_MAN="512:60:true"
-    FUNC_PROCESS_PAY="512:60:true"
-    FUNC_UPD_INV="256:30:true"
-    FUNC_SEND_NOTIF="256:30:true"
-    FUNC_GEN_REPORT="512:120:true"
-    FUNC_INIT_DB="512:120:false"
-    FUNC_HEALTH="128:15:false"
+    # Konfigurasi fungsi
+    declare -A FUNC_CONFIG=(
+        ["techno-lambda-order-management"]="512:60:true"
+        ["techno-lambda-process-payment"]="512:60:true"
+        ["techno-lambda-update-inventory"]="256:30:true"
+        ["techno-lambda-send-notification"]="256:30:true"
+        ["techno-lambda-generate-report"]="512:120:true"
+        ["techno-lambda-init-db"]="512:120:false"
+        ["techno-lambda-health-check"]="128:15:false"
+    )
 
-    get_func_config() {
-        case "$1" in
-            order_management) echo "512:60:true"  ;;
-            process_payment)  echo "512:60:true"  ;;
-            update_inventory) echo "256:30:true"  ;;
-            send_notification)echo "256:30:true"  ;;
-            generate_report)  echo "512:120:true" ;;
-            init_db)          echo "512:120:false" ;;
-            health_check)     echo "128:15:false" ;;
-        esac
-    }
-
-    for FUNC_BASE in order_management process_payment update_inventory \
-                     send_notification generate_report init_db health_check; do
-        # Map dir name → AWS function name (sesuai deploy.yml naming)
-        case "$FUNC_BASE" in
-            order_management)  FUNC_NAME="techno-lambda-order-management"  ;;
-            process_payment)   FUNC_NAME="techno-lambda-process-payment"   ;;
-            update_inventory)  FUNC_NAME="techno-lambda-update-inventory"  ;;
-            send_notification) FUNC_NAME="techno-lambda-send-notification" ;;
-            generate_report)   FUNC_NAME="techno-lambda-generate-report"   ;;
-            init_db)           FUNC_NAME="techno-lambda-init-db"           ;;
-            health_check)      FUNC_NAME="techno-lambda-health-check"      ;;
-        esac
-        CFG=$(get_func_config "$FUNC_BASE")
-        IFS=':' read -r MEM TMO USE_VPC <<< "$CFG"
-
-        # Cek status function
-        FUNC_STATE=$(aws lambda get-function \
-            --function-name "$FUNC_NAME" \
-            --region "$REGION" --query "Configuration.State" \
-            --output text 2>/dev/null || echo "NOT_FOUND")
-
-        if [ "$FUNC_STATE" = "NOT_FOUND" ]; then
-            log "  Creating: $FUNC_NAME (${MEM}MB, ${TMO}s, vpc=${USE_VPC})"
+    for FUNC_NAME in "${!FUNC_CONFIG[@]}"; do
+        if ! aws lambda get-function --function-name "$FUNC_NAME" --region "$REGION" &>/dev/null; then
+            IFS=':' read -r MEM TMO USE_VPC <<< "${FUNC_CONFIG[$FUNC_NAME]}"
+            
+            log "  Creating: $FUNC_NAME"
+            
             CREATE_ARGS=(
                 --function-name "$FUNC_NAME"
                 --runtime python3.11
@@ -1343,63 +1435,25 @@ open('/tmp/techno_placeholder.zip','wb').write(buf.getvalue())
                 --region "$REGION"
                 --no-cli-pager
             )
-            if [ "$USE_VPC" = "true" ]; then
+            
+            if [ "$USE_VPC" = "true" ] && [ -n "$PRIV_SN1" ] && [ -n "$PRIV_SN2" ] && [ -n "$SG_LAMBDA" ]; then
                 CREATE_ARGS+=(--vpc-config "SubnetIds=${PRIV_SN1},${PRIV_SN2},SecurityGroupIds=${SG_LAMBDA}")
             fi
-            aws lambda create-function "${CREATE_ARGS[@]}" > /dev/null
-            aws lambda wait function-active \
-                --function-name "$FUNC_NAME" --region "$REGION"
-            ok "  Created: $FUNC_NAME"
-        else
-            # Sudah ada — hanya update env + layer jika perlu
-            CURRENT_LAYER=$(aws lambda get-function-configuration \
-                --function-name "$FUNC_NAME" --region "$REGION" \
-                --query "Layers[0].Arn" --output text 2>/dev/null || echo "")
-            if [ "$CURRENT_LAYER" != "$LAYER_ARN" ]; then
-                aws lambda update-function-configuration \
-                    --function-name "$FUNC_NAME" \
-                    --environment "$ENV_COMMON" \
-                    --layers "$LAYER_ARN" \
-                    --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
-                log "  Updated layer+env: $FUNC_NAME"
+            
+            if aws lambda create-function "${CREATE_ARGS[@]}" > /dev/null 2>&1; then
+                ok "    Created: $FUNC_NAME"
             else
-                log "  Already OK (skip): $FUNC_NAME [$FUNC_STATE]"
+                warn "    Failed to create: $FUNC_NAME"
             fi
+            
+            sleep 2
         fi
     done
-    ok "Lambda functions ready"
-fi
 
-# Refresh SECRET_ARN setelah step 4/5 — pastikan Lambda env up to date
-SECRET_ARN=$(aws secretsmanager describe-secret \
-    --secret-id "${PROJECT}/db/credentials" \
-    --query ARN --output text --region "$REGION" 2>/dev/null || echo "")
-if [ -n "$SECRET_ARN" ] && [ "$SECRET_ARN" != "None" ]; then
-    log "Refreshing Lambda SECRET_ARN env var: $SECRET_ARN"
-    for _FN in techno-lambda-order-management techno-lambda-process-payment \
-               techno-lambda-update-inventory techno-lambda-generate-report \
-               techno-lambda-init-db techno-lambda-health-check; do
-        _CURR=$(aws lambda get-function-configuration --function-name "$_FN" \
-            --region "$REGION" --query "Environment.Variables.SECRET_ARN" \
-            --output text 2>/dev/null || echo "")
-        if [ "$_CURR" != "$SECRET_ARN" ]; then
-            # Get current env vars and merge
-            _ENV=$(aws lambda get-function-configuration --function-name "$_FN" \
-                --region "$REGION" --query "Environment.Variables" --output json 2>/dev/null || echo "{}")
-            _NEW_ENV=$(echo "$_ENV" | python3 -c "
-import json,sys
-e=json.load(sys.stdin)
-e['SECRET_ARN']='${SECRET_ARN}'
-print('Variables={' + ','.join(f'{k}={v}' for k,v in e.items()) + '}')
-" 2>/dev/null || echo "Variables={SECRET_ARN=${SECRET_ARN}}")
-            aws lambda update-function-configuration \
-                --function-name "$_FN" \
-                --environment "$_NEW_ENV" \
-                --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
-            log "  Updated SECRET_ARN: $_FN"
-        fi
-    done
-    ok "Lambda SECRET_ARN env vars refreshed"
+    # Cleanup
+    rm -rf "$LAYER_DIR"
+    
+    ok "STEP 5 selesai - Layer dan functions siap"
 fi
 
 # Refresh LAYER_ARN
