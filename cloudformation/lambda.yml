@@ -6,7 +6,7 @@ Resources:
     Properties:
       Runtime: python3.11
       Role: arn:aws:iam::227560787770:role/LabRole
-      Handler: generate_report.handler
+      Handler: lambda_function.handler
       Code:
         ZipFile: |
           const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
@@ -31,7 +31,7 @@ Resources:
     Properties:
       Runtime: python3.11
       Role: arn:aws:iam::227560787770:role/LabRole
-      Handler: health_check.handler
+      Handler: lambda_function.handler
       Code:
         ZipFile: |
           const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
@@ -56,7 +56,7 @@ Resources:
     Properties:
       Runtime: python3.11
       Role: arn:aws:iam::227560787770:role/LabRole
-      Handler: init_db.handler
+      Handler: lambda_function.handler
       Code:
         ZipFile: |
           const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
@@ -81,7 +81,7 @@ Resources:
     Properties:
       Runtime: python3.11
       Role: arn:aws:iam::227560787770:role/LabRole
-      Handler: order_management.handler
+      Handler: lambda_function.handler
       Code:
         ZipFile: |
           const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
@@ -106,7 +106,7 @@ Resources:
     Properties:
       Runtime: python3.11
       Role: arn:aws:iam::227560787770:role/LabRole
-      Handler: process_payment.handler
+      Handler: lambda_function.handler
       Code:
         ZipFile: |
           const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
@@ -131,7 +131,7 @@ Resources:
     Properties:
       Runtime: python3.11
       Role: arn:aws:iam::227560787770:role/LabRole
-      Handler: send_notification.handler
+      Handler: lambda_function.handler
       Code:
         ZipFile: |
           const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
@@ -156,7 +156,7 @@ Resources:
     Properties:
       Runtime: python3.11
       Role: arn:aws:iam::227560787770:role/LabRole
-      Handler: update_inventory.handler
+      Handler: lambda_function.handler
       Code:
         ZipFile: |
           const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");

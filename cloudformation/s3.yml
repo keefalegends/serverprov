@@ -16,11 +16,7 @@ Resources:
       Tags:
         - Key: 'Name'
           Value: 'techno-orders-keefa-26'
-Outputs:
-  BucketName:
-    Value: !Ref S3Bucketorder
-    Description: s3 bucket for order.
-
+          
   S3Bucketlogs:
     Type: 'AWS::S3::Bucket'
     Properties:
