@@ -1,0 +1,13 @@
+Resources:
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: techno-sns-order-notification
+
+
+  MySubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: handi@seamolec.org.com
+      Protocol: email
+      TopicArn: !Ref 'Topic'

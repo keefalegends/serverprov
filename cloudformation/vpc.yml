@@ -1,0 +1,129 @@
+Resources:
+  technovpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 35.10.0.0/18
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-vpc'
+  ipv6CidrBlock:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref technovpc
+      AmazonProvidedIpv6CidrBlock: true
+
+
+  technopublicsubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref technovpc
+      CidrBlock: 35.10.0.0/25
+      AvailabilityZone: "us-east-1a"
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-public-subnet-1'
+
+  technopublicsubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref technovpc
+      CidrBlock: 35.10.1.0/25
+      AvailabilityZone: "us-east-1b"
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-public-subnet-2'
+  
+  technoprivatesubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref technovpc
+      CidrBlock: 35.10.11.0/25
+      AvailabilityZone: "us-east-1a"
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-private-subnet-1'
+
+  technoprivatesubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref technovpc
+      CidrBlock: 35.10.12.0/25
+      AvailabilityZone: "us-east-1b"
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-private-subnet-2'
+
+  publicrt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:  
+        Ref: technovpc
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-public-rt'
+
+  privatert:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:  
+        Ref: technovpc
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-private-rt'
+
+#Security Groups
+  technosglambda:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: technovpc
+    Properties:
+      GroupDescription: techno-sg-lambda
+      VpcId: !Ref technovpc
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-sg-lambda'
+
+  technosgrds:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: technovpc
+    Properties:
+      GroupDescription: technosgvpcendpoint
+      VpcId: !Ref technovpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.0.0.0/24
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-sg-rds'
+
+
+  technosgvpcendpoint:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: technovpc
+    Properties:
+      GroupDescription: technosgvpcendpoint
+      VpcId: !Ref technovpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 35.10.0.0/18
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 35.10.0.0/18
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+      Tags:
+          - Key: 'Name'
+            Value: 'techno-sg-vpc-endpoint'

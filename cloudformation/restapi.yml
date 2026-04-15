@@ -1,0 +1,41 @@
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub
+        - ${ResourceName} From Stack ${AWS::StackName}
+        - ResourceName: techno-restapi
+      StageName: Prod
+      DefinitionBody:
+        openapi: '3.0'
+        info: {}
+        paths:
+          /orders:
+            get:
+              responses: {}
+            post:
+              responses: {}
+          /orders/{id}:
+            get:
+              responses: {}
+            put:
+              responses: {}
+            delete:
+              responses: {}
+          /status[id]:
+            get:
+              responses: {}
+          /customer:
+            get:
+              responses: {}
+          /product:
+            get:
+              responses: {}
+          /health:
+            get:
+              responses: {}
+      EndpointConfiguration: REGIONAL
+      TracingEnabled: true
+      Cors:
+        MaxAge: 5

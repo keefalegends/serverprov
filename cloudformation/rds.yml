@@ -1,0 +1,21 @@
+Resources:
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: <String>
+      SubnetIds:
+        - <String>
+  DBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      DBSecurityGroupIngress:
+        - {}
+      GroupDescription: <String>
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties: {}
+  CustomDBEngineVersion:
+    Type: AWS::RDS::CustomDBEngineVersion
+    Properties:
+      EngineVersion: <String>
+      Engine: <String>

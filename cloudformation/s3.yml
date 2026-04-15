@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  S3Bucketorder:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      AccessControl: Private
+      LifecycleConfiguration:
+        Rules:
+          - Id: GlacierRule
+            Prefix: glacier
+            Status: Enabled
+            ExpirationInDays: 365
+            Transitions:
+              - TransitionInDays: 120
+                StorageClass: GLACIER
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-orders-keefa-26'
+Outputs:
+  BucketName:
+    Value: !Ref S3Bucketorder
+    Description: s3 bucket for order.
+
+  S3Bucketlogs:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      AccessControl: Private
+      LifecycleConfiguration:
+        Rules:
+          - Id: GlacierRule
+            Prefix: glacier
+            Status: Enabled
+            ExpirationInDays: 120
+            Transitions:
+              - TransitionInDays: 14
+                StorageClass: GLACIER
+      Tags:
+        - Key: 'Name'
+          Value: 'techno-logs-keefa-26'
