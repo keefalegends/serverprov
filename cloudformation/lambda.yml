@@ -1,15 +1,47 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: VPC function.
+Description: Lambda function ListBucketsCommand.
 Resources:
-  Function1:
+  generatereport:
     Type: AWS::Lambda::Function
     Properties:
-      Handler: lambda_function.handler
-      Role: arn:aws:iam::227560787770:role/LabRole
-      Code:
-        S3Bucket: amzn-s3-lambda-bucket-342
       Runtime: python3.11
-      Timeout: 5
+      Role: arn:aws:iam::227560787770:role/LabRole
+      Handler: generate_report.handler
+      Code:
+        ZipFile: |
+          const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
+          const s3 = new S3Client({ region: "us-east-1" }); // replace "us-east-1" with your AWS Region
+
+          exports.handler = async function(event) {
+            const command = new ListBucketsCommand({});
+            const response = await s3.send(command);
+            return response.Buckets;
+          };
+      TracingConfig:
+        Mode: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-0dc37b86e72ef28ab
+        SubnetIds:
+          - subnet-0634f9388bdabd357
+          - subnet-0e154a155d82a54f3        
+
+  healthcheck:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Role: arn:aws:iam::227560787770:role/LabRole
+      Handler: health_check.handler
+      Code:
+        ZipFile: |
+          const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
+          const s3 = new S3Client({ region: "us-east-1" }); // replace "us-east-1" with your AWS Region
+
+          exports.handler = async function(event) {
+            const command = new ListBucketsCommand({});
+            const response = await s3.send(command);
+            return response.Buckets;
+          };
       TracingConfig:
         Mode: Active
       VpcConfig:
@@ -19,16 +51,22 @@ Resources:
           - subnet-0634f9388bdabd357
           - subnet-0e154a155d82a54f3
 
-  Function2:
+  initdb:
     Type: AWS::Lambda::Function
     Properties:
-      Handler: lambda_function.handler
-      Role: arn:aws:iam::227560787770:role/LabRole
-      Code:
-        S3Bucket: amzn-s3-lambda-bucket-342
-        S3Key: health_check.zip
       Runtime: python3.11
-      Timeout: 5
+      Role: arn:aws:iam::227560787770:role/LabRole
+      Handler: init_db.handler
+      Code:
+        ZipFile: |
+          const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
+          const s3 = new S3Client({ region: "us-east-1" }); // replace "us-east-1" with your AWS Region
+
+          exports.handler = async function(event) {
+            const command = new ListBucketsCommand({});
+            const response = await s3.send(command);
+            return response.Buckets;
+          };
       TracingConfig:
         Mode: Active
       VpcConfig:
@@ -38,16 +76,22 @@ Resources:
           - subnet-0634f9388bdabd357
           - subnet-0e154a155d82a54f3
 
-  Function3:
+  ordermanagement:
     Type: AWS::Lambda::Function
     Properties:
-      Handler: lambda_function.handler
-      Role: arn:aws:iam::227560787770:role/LabRole
-      Code:
-        S3Bucket: amzn-s3-lambda-bucket-342
-        S3Key: init_db.zip
       Runtime: python3.11
-      Timeout: 5
+      Role: arn:aws:iam::227560787770:role/LabRole
+      Handler: order_management.handler
+      Code:
+        ZipFile: |
+          const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
+          const s3 = new S3Client({ region: "us-east-1" }); // replace "us-east-1" with your AWS Region
+
+          exports.handler = async function(event) {
+            const command = new ListBucketsCommand({});
+            const response = await s3.send(command);
+            return response.Buckets;
+          };
       TracingConfig:
         Mode: Active
       VpcConfig:
@@ -57,16 +101,22 @@ Resources:
           - subnet-0634f9388bdabd357
           - subnet-0e154a155d82a54f3
 
-  Function4:
+  processpayment:
     Type: AWS::Lambda::Function
     Properties:
-      Handler: lambda_function.handler
-      Role: arn:aws:iam::227560787770:role/LabRole
-      Code:
-        S3Bucket: amzn-s3-lambda-bucket-342
-        S3Key: order_management.zip
       Runtime: python3.11
-      Timeout: 5
+      Role: arn:aws:iam::227560787770:role/LabRole
+      Handler: process_payment.handler
+      Code:
+        ZipFile: |
+          const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
+          const s3 = new S3Client({ region: "us-east-1" }); // replace "us-east-1" with your AWS Region
+
+          exports.handler = async function(event) {
+            const command = new ListBucketsCommand({});
+            const response = await s3.send(command);
+            return response.Buckets;
+          };
       TracingConfig:
         Mode: Active
       VpcConfig:
@@ -76,16 +126,22 @@ Resources:
           - subnet-0634f9388bdabd357
           - subnet-0e154a155d82a54f3
 
-  Function5:
+  sendnotification:
     Type: AWS::Lambda::Function
     Properties:
-      Handler: lambda_function.handler
-      Role: arn:aws:iam::227560787770:role/LabRole
-      Code:
-        S3Bucket: amzn-s3-lambda-bucket-342
-        S3Key: process_payment.zip
       Runtime: python3.11
-      Timeout: 5
+      Role: arn:aws:iam::227560787770:role/LabRole
+      Handler: send_notification.handler
+      Code:
+        ZipFile: |
+          const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
+          const s3 = new S3Client({ region: "us-east-1" }); // replace "us-east-1" with your AWS Region
+
+          exports.handler = async function(event) {
+            const command = new ListBucketsCommand({});
+            const response = await s3.send(command);
+            return response.Buckets;
+          };
       TracingConfig:
         Mode: Active
       VpcConfig:
@@ -95,35 +151,22 @@ Resources:
           - subnet-0634f9388bdabd357
           - subnet-0e154a155d82a54f3
 
-  Function6:
+  updateinventory:
     Type: AWS::Lambda::Function
     Properties:
-      Handler: lambda_function.handler
-      Role: arn:aws:iam::227560787770:role/LabRole
-      Code:
-        S3Bucket: amzn-s3-lambda-bucket-342
-        S3Key: send_notification.zip
       Runtime: python3.11
-      Timeout: 5
-      TracingConfig:
-        Mode: Active
-      VpcConfig:
-        SecurityGroupIds:
-          - sg-0dc37b86e72ef28ab
-        SubnetIds:
-          - subnet-0634f9388bdabd357
-          - subnet-0e154a155d82a54f3
+      Role: arn:aws:iam::227560787770:role/LabRole
+      Handler: update_inventory.handler
+      Code:
+        ZipFile: |
+          const { S3Client, ListBucketsCommand } = require("@aws-sdk/client-s3");
+          const s3 = new S3Client({ region: "us-east-1" }); // replace "us-east-1" with your AWS Region
 
-  Function7:
-    Type: AWS::Lambda::Function
-    Properties:
-      Handler: lambda_function.handler
-      Role: arn:aws:iam::227560787770:role/LabRole
-      Code:
-        S3Bucket: amzn-s3-lambda-bucket-342
-        S3Key: update_inventory.zip
-      Runtime: python3.11
-      Timeout: 5
+          exports.handler = async function(event) {
+            const command = new ListBucketsCommand({});
+            const response = await s3.send(command);
+            return response.Buckets;
+          };
       TracingConfig:
         Mode: Active
       VpcConfig:
