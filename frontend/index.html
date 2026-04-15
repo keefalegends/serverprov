@@ -903,7 +903,7 @@ async function lookupExecution(orderId) { await openOrderExecution(orderId); }
 // ══════════════════════════════════════
 // PRODUCTS
 // ══════════════════════════════════════
-async function loadProducts() {w
+async function loadProducts() {
   try {
     const d = await api('/products');
     S.products = d.products||[];
